@@ -1,0 +1,71 @@
+"""op-contract-get-ipam-prefix-list-resolver-rules."""
+from __future__ import annotations
+
+from behavioral_harness import tags
+
+CHECK = "op-contract-get-ipam-prefix-list-resolver-rules"
+GROUP = "error-semantics"
+SERVICES = ["ec2"]
+
+# Well-formed but nonexistent: matches the id scheme other IpamPrefixListResolver operations
+# validate against, so the rejection below exercises the NotFound boundary rather than input-shape
+# validation.
+_PLACEHOLDER_RESOLVER_ID = "ipam-plr-0000000000000000"
+
+
+@tags("axis:rejection", "cap:c1", "concern:negative-classes", "plane:control")
+def run(ctx) -> None:
+    """GetIpamPrefixListResolverRules: DryRun confirms the permission-check contract,
+    and turning DryRun off surfaces the specific NotFound rejection for the same call.
+    """
+
+    ec2 = ctx.client("ec2")
+    if not hasattr(ec2, "get_ipam_prefix_list_resolver_rules"):
+        raise AssertionError(
+            "unreachable: installed botocore lacks get_ipam_prefix_list_resolver_rules "
+            "(IPAM prefix list resolver is a very recent EC2 feature)"
+        )
+
+    # success-path contract: DryRun short-circuits before resource resolution and
+    # reports whether the caller would have been allowed to proceed.
+    dry_run_code, dry_run_message, _ = _client_error(
+        lambda: ec2.get_ipam_prefix_list_resolver_rules(
+            IpamPrefixListResolverId=_PLACEHOLDER_RESOLVER_ID, DryRun=True
+        )
+    )
+    assert dry_run_code == "DryRunOperation", (
+        f"expected DryRunOperation for an authorized DryRun call, got {dry_run_code!r}"
+    )
+    assert dry_run_message == "Request would have succeeded, but DryRun flag is set.", f"unexpected DryRunOperation message: {dry_run_message!r}"
+
+    # error boundary: without DryRun, the same well-formed id is an existence lookup
+    # that must be rejected as NotFound, not silently narrowed to an empty result.
+    real_code, real_message, status = _client_error(
+        lambda: ec2.get_ipam_prefix_list_resolver_rules(
+            IpamPrefixListResolverId=_PLACEHOLDER_RESOLVER_ID
+        )
+    )
+    assert real_code == "InvalidIpamPrefixListResolverId.NotFound", (
+        f"expected InvalidIpamPrefixListResolverId.NotFound, got {real_code!r}"
+    )
+    assert real_message == f"The ipam-prefix-list-resolver ID '{_PLACEHOLDER_RESOLVER_ID}' does not exist", f"unexpected {real_code} message: {real_message!r}"
+    assert status == 400, f"expected a client (400) error, got HTTP {status}"
+
+
+def _client_error(fn):
+    """Call fn() and return (code, message, http_status) of the ClientError it raises.
+    An unexpected success raises AssertionError rather than returning a falsy value."""
+    from botocore.exceptions import ClientError
+
+    try:
+        result = fn()
+    except ClientError as exc:
+        err = exc.response["Error"]
+        return err["Code"], err.get("Message"), exc.response["ResponseMetadata"]["HTTPStatusCode"]
+    raise AssertionError(f"expected the call to be rejected, but it SUCCEEDED and returned {result!r}")
+
+
+if __name__ == "__main__":
+    from fidelity_tests_runner import main
+
+    main(run)

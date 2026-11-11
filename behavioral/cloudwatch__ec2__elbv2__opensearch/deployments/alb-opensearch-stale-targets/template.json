@@ -1,0 +1,520 @@
+{
+ "AWSTemplateFormatVersion": "2010-09-09",
+ "Description": "A VPC OpenSearch domain fronted by an internal ALB whose IP target groups point at addresses no ENI holds. Carved away: the NAT gateway and public subnets (nothing needs egress), the VPC flow log (no solve step reads it), the customer-managed KMS key (the service default key; a KMS key cannot be deleted inside a run).",
+ "Parameters": {
+  "Token": {
+   "Type": "String",
+   "AllowedPattern": "[a-z][a-z0-9-]{3,23}",
+   "Description": "minted run token; every physical name derives from it"
+  },
+  "MasterPassword": {
+   "Type": "String",
+   "NoEcho": true,
+   "MinLength": 8,
+   "Description": "minted per run"
+  }
+ },
+ "Resources": {
+  "Vpc": {
+   "Type": "AWS::EC2::VPC",
+   "Properties": {
+    "CidrBlock": "10.80.0.0/16",
+    "EnableDnsSupport": true,
+    "EnableDnsHostnames": true,
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": {
+       "Fn::Sub": "${Token}-vpc"
+      }
+     },
+     {
+      "Key": "sim2real",
+      "Value": "api-and-observability"
+     }
+    ]
+   }
+  },
+  "StaleSubnet": {
+   "Type": "AWS::EC2::Subnet",
+   "Properties": {
+    "VpcId": {
+     "Ref": "Vpc"
+    },
+    "CidrBlock": "10.80.4.0/22",
+    "AvailabilityZone": {
+     "Fn::Select": [
+      1,
+      {
+       "Fn::GetAZs": ""
+      }
+     ]
+    },
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": {
+       "Fn::Sub": "${Token}-stale"
+      }
+     },
+     {
+      "Key": "sim2real",
+      "Value": "api-and-observability"
+     }
+    ]
+   }
+  },
+  "PrivateSubnetA": {
+   "Type": "AWS::EC2::Subnet",
+   "Properties": {
+    "VpcId": {
+     "Ref": "Vpc"
+    },
+    "CidrBlock": "10.80.8.0/22",
+    "AvailabilityZone": {
+     "Fn::Select": [
+      0,
+      {
+       "Fn::GetAZs": ""
+      }
+     ]
+    },
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": {
+       "Fn::Sub": "${Token}-private-a"
+      }
+     },
+     {
+      "Key": "sim2real",
+      "Value": "api-and-observability"
+     }
+    ]
+   }
+  },
+  "PrivateSubnetB": {
+   "Type": "AWS::EC2::Subnet",
+   "Properties": {
+    "VpcId": {
+     "Ref": "Vpc"
+    },
+    "CidrBlock": "10.80.12.0/22",
+    "AvailabilityZone": {
+     "Fn::Select": [
+      1,
+      {
+       "Fn::GetAZs": ""
+      }
+     ]
+    },
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": {
+       "Fn::Sub": "${Token}-private-b"
+      }
+     },
+     {
+      "Key": "sim2real",
+      "Value": "api-and-observability"
+     }
+    ]
+   }
+  },
+  "AlbSg": {
+   "Type": "AWS::EC2::SecurityGroup",
+   "Properties": {
+    "GroupDescription": "Internal ALB SG",
+    "VpcId": {
+     "Ref": "Vpc"
+    },
+    "SecurityGroupIngress": [
+     {
+      "IpProtocol": "tcp",
+      "FromPort": 443,
+      "ToPort": 443,
+      "CidrIp": "10.80.0.0/16",
+      "Description": "HTTPS from VPC"
+     }
+    ],
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": {
+       "Fn::Sub": "${Token}-alb-sg"
+      }
+     },
+     {
+      "Key": "sim2real",
+      "Value": "api-and-observability"
+     }
+    ]
+   }
+  },
+  "OpenSearchSg": {
+   "Type": "AWS::EC2::SecurityGroup",
+   "Properties": {
+    "GroupDescription": "OpenSearch domain SG",
+    "VpcId": {
+     "Ref": "Vpc"
+    },
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": {
+       "Fn::Sub": "${Token}-os-sg"
+      }
+     },
+     {
+      "Key": "sim2real",
+      "Value": "api-and-observability"
+     }
+    ]
+   }
+  },
+  "OpenSearchFromAlb": {
+   "Type": "AWS::EC2::SecurityGroupIngress",
+   "Properties": {
+    "GroupId": {
+     "Fn::GetAtt": [
+      "OpenSearchSg",
+      "GroupId"
+     ]
+    },
+    "IpProtocol": "tcp",
+    "FromPort": 443,
+    "ToPort": 443,
+    "SourceSecurityGroupId": {
+     "Fn::GetAtt": [
+      "AlbSg",
+      "GroupId"
+     ]
+    },
+    "Description": "HTTPS from ALB"
+   }
+  },
+  "Domain": {
+   "Type": "AWS::OpenSearchService::Domain",
+   "Properties": {
+    "DomainName": {
+     "Ref": "Token"
+    },
+    "EngineVersion": "OpenSearch_2.11",
+    "ClusterConfig": {
+     "InstanceType": "t3.small.search",
+     "InstanceCount": 1,
+     "ZoneAwarenessEnabled": false,
+     "MultiAZWithStandbyEnabled": false
+    },
+    "EBSOptions": {
+     "EBSEnabled": true,
+     "VolumeType": "gp3",
+     "VolumeSize": 10
+    },
+    "VPCOptions": {
+     "SubnetIds": [
+      {
+       "Ref": "PrivateSubnetA"
+      }
+     ],
+     "SecurityGroupIds": [
+      {
+       "Ref": "OpenSearchSg"
+      }
+     ]
+    },
+    "EncryptionAtRestOptions": {
+     "Enabled": true
+    },
+    "NodeToNodeEncryptionOptions": {
+     "Enabled": true
+    },
+    "DomainEndpointOptions": {
+     "EnforceHTTPS": true,
+     "TLSSecurityPolicy": "Policy-Min-TLS-1-2-2019-07"
+    },
+    "AdvancedSecurityOptions": {
+     "Enabled": true,
+     "InternalUserDatabaseEnabled": true,
+     "MasterUserOptions": {
+      "MasterUserName": "admin",
+      "MasterUserPassword": {
+       "Ref": "MasterPassword"
+      }
+     }
+    },
+    "AccessPolicies": {
+     "Version": "2012-10-17",
+     "Statement": [
+      {
+       "Effect": "Allow",
+       "Principal": {
+        "AWS": "*"
+       },
+       "Action": "es:*",
+       "Resource": {
+        "Fn::Sub": "arn:${AWS::Partition}:es:${AWS::Region}:${AWS::AccountId}:domain/${Token}/*"
+       },
+       "Condition": {
+        "StringEquals": {
+         "aws:PrincipalAccount": {
+          "Ref": "AWS::AccountId"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "Tags": [
+     {
+      "Key": "sim2real",
+      "Value": "api-and-observability"
+     }
+    ]
+   }
+  },
+  "Alb": {
+   "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+   "Properties": {
+    "Name": {
+     "Fn::Sub": "${Token}-alb"
+    },
+    "Scheme": "internal",
+    "Type": "application",
+    "Subnets": [
+     {
+      "Ref": "PrivateSubnetA"
+     },
+     {
+      "Ref": "PrivateSubnetB"
+     }
+    ],
+    "SecurityGroups": [
+     {
+      "Ref": "AlbSg"
+     }
+    ],
+    "Tags": [
+     {
+      "Key": "sim2real",
+      "Value": "api-and-observability"
+     }
+    ]
+   }
+  },
+  "DashboardsTg": {
+   "Type": "AWS::ElasticLoadBalancingV2::TargetGroup",
+   "Properties": {
+    "Name": {
+     "Fn::Sub": "${Token}-dash"
+    },
+    "VpcId": {
+     "Ref": "Vpc"
+    },
+    "Port": 443,
+    "Protocol": "HTTPS",
+    "TargetType": "ip",
+    "HealthCheckPath": "/_cluster/health",
+    "HealthCheckEnabled": true,
+    "HealthCheckProtocol": "HTTPS",
+    "HealthCheckPort": "443",
+    "HealthCheckIntervalSeconds": 30,
+    "HealthCheckTimeoutSeconds": 10,
+    "HealthyThresholdCount": 2,
+    "UnhealthyThresholdCount": 3,
+    "Matcher": {
+     "HttpCode": "200,301,302"
+    },
+    "Targets": [
+     {
+      "Id": "10.80.4.37",
+      "Port": 443
+     },
+     {
+      "Id": "10.80.8.112",
+      "Port": 443
+     }
+    ],
+    "Tags": [
+     {
+      "Key": "sim2real",
+      "Value": "api-and-observability"
+     }
+    ]
+   }
+  },
+  "ApiTg": {
+   "Type": "AWS::ElasticLoadBalancingV2::TargetGroup",
+   "Properties": {
+    "Name": {
+     "Fn::Sub": "${Token}-api"
+    },
+    "VpcId": {
+     "Ref": "Vpc"
+    },
+    "Port": 443,
+    "Protocol": "HTTPS",
+    "TargetType": "ip",
+    "HealthCheckPath": "/",
+    "HealthCheckEnabled": true,
+    "HealthCheckProtocol": "HTTPS",
+    "HealthCheckPort": "443",
+    "HealthCheckIntervalSeconds": 30,
+    "HealthCheckTimeoutSeconds": 10,
+    "HealthyThresholdCount": 2,
+    "UnhealthyThresholdCount": 3,
+    "Matcher": {
+     "HttpCode": "200,301,302"
+    },
+    "Targets": [
+     {
+      "Id": "10.80.4.37",
+      "Port": 443
+     },
+     {
+      "Id": "10.80.8.112",
+      "Port": 443
+     }
+    ],
+    "Tags": [
+     {
+      "Key": "sim2real",
+      "Value": "api-and-observability"
+     }
+    ]
+   }
+  },
+  "HttpListener": {
+   "Type": "AWS::ElasticLoadBalancingV2::Listener",
+   "Properties": {
+    "LoadBalancerArn": {
+     "Ref": "Alb"
+    },
+    "Port": 80,
+    "Protocol": "HTTP",
+    "DefaultActions": [
+     {
+      "Type": "forward",
+      "TargetGroupArn": {
+       "Ref": "DashboardsTg"
+      }
+     }
+    ]
+   }
+  },
+  "ApiRoute": {
+   "Type": "AWS::ElasticLoadBalancingV2::ListenerRule",
+   "Properties": {
+    "ListenerArn": {
+     "Ref": "HttpListener"
+    },
+    "Priority": 10,
+    "Conditions": [
+     {
+      "Field": "path-pattern",
+      "PathPatternConfig": {
+       "Values": [
+        "/_cat/*",
+        "/_cluster/*",
+        "/_nodes/*"
+       ]
+      }
+     }
+    ],
+    "Actions": [
+     {
+      "Type": "forward",
+      "TargetGroupArn": {
+       "Ref": "ApiTg"
+      }
+     }
+    ]
+   }
+  },
+  "UnhealthyHostsAlarm": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": {
+     "Fn::Sub": "${Token}-unhealthy-hosts"
+    },
+    "Namespace": "AWS/ApplicationELB",
+    "MetricName": "UnHealthyHostCount",
+    "Dimensions": [
+     {
+      "Name": "TargetGroup",
+      "Value": {
+       "Fn::GetAtt": [
+        "DashboardsTg",
+        "TargetGroupFullName"
+       ]
+      }
+     },
+     {
+      "Name": "LoadBalancer",
+      "Value": {
+       "Fn::GetAtt": [
+        "Alb",
+        "LoadBalancerFullName"
+       ]
+      }
+     }
+    ],
+    "Statistic": "Maximum",
+    "Period": 60,
+    "EvaluationPeriods": 2,
+    "Threshold": 0,
+    "ComparisonOperator": "GreaterThanThreshold",
+    "TreatMissingData": "breaching"
+   }
+  }
+ },
+ "Outputs": {
+  "VpcId": {
+   "Value": {
+    "Ref": "Vpc"
+   }
+  },
+  "DomainName": {
+   "Value": {
+    "Ref": "Domain"
+   }
+  },
+  "DomainEndpoint": {
+   "Value": {
+    "Fn::GetAtt": [
+     "Domain",
+     "DomainEndpoint"
+    ]
+   }
+  },
+  "AlbDnsName": {
+   "Value": {
+    "Fn::GetAtt": [
+     "Alb",
+     "DNSName"
+    ]
+   }
+  },
+  "AlbArn": {
+   "Value": {
+    "Ref": "Alb"
+   }
+  },
+  "DashboardsTgArn": {
+   "Value": {
+    "Ref": "DashboardsTg"
+   }
+  },
+  "ApiTgArn": {
+   "Value": {
+    "Ref": "ApiTg"
+   }
+  },
+  "AlarmName": {
+   "Value": {
+    "Ref": "UnhealthyHostsAlarm"
+   }
+  }
+ }
+}

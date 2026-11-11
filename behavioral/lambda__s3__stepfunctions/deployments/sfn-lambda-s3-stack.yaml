@@ -1,0 +1,112 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: SFN + Lambda + S3 full stack
+
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'sim2real-xsvc-cfn-bucket-${AWS::StackName}'
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'sim2real-xsvc-cfn-lambda-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::sim2real-xsvc-cfn-bucket-${AWS::StackName}/*'
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  SFNExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'sim2real-xsvc-cfn-sfn-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SFNPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: '*'
+
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub 'sim2real-xsvc-cfn-sm-${AWS::StackName}'
+      RoleArn: !GetAtt SFNExecutionRole.Arn
+      DefinitionString: |
+        {
+          "Comment": "Pass through state machine",
+          "StartAt": "PassState",
+          "States": {
+            "PassState": {
+              "Type": "Pass",
+              "End": true
+            }
+          }
+        }
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: StateMachine
+    Properties:
+      FunctionName: !Sub 'sim2real-xsvc-cfn-fn-${AWS::StackName}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref Bucket
+          STATE_MACHINE_ARN: !Ref StateMachine
+      Code:
+        ZipFile: |
+          import boto3, json, os
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              bucket = os.environ['BUCKET_NAME']
+              key = 'events/invocation.json'
+              s3.put_object(Bucket=bucket, Key=key, Body=json.dumps(event))
+              return {'bucket': bucket, 'key': key, 'status': 'ok'}
+
+Outputs:
+  BucketName:
+    Value: !Ref Bucket
+  FunctionArn:
+    Value: !GetAtt LambdaFunction.Arn
+  FunctionName:
+    Value: !Ref LambdaFunction
+  StateMachineArn:
+    Value: !Ref StateMachine

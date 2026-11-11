@@ -1,0 +1,253 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  An Auto Scaling group with an AutoScalingRollingUpdate UpdatePolicy whose
+  instances signal the stack themselves. Changing the Generation parameter
+  rewrites the launch template's UserData, which changes the group's
+  LaunchTemplate property and is therefore one of the documented triggers for a
+  rolling update. Changing SignalExitCode to anything but 0 makes the
+  replacement instances signal FAILURE instead, which is how the check drives
+  the rollback leg without breaking anything else.
+
+  Instances signal with `aws cloudformation signal-resource` from the
+  preinstalled AWS CLI rather than with cfn-signal, so the template does not
+  depend on aws-cfn-bootstrap being present or installable on the AMI. That
+  needs egress to the CloudFormation endpoint, hence the internet gateway and
+  MapPublicIpOnLaunch, and it needs an instance profile granting
+  cloudformation:SignalResource on this stack only.
+
+Parameters:
+  ImageId:
+    Type: String
+    Description: AMI for the launch template (passed in by the check).
+  LaunchTemplateName:
+    Type: String
+    Description: Name for the launch template the group is pinned to.
+  AsgName:
+    Type: String
+    Description: Name for the Auto Scaling group.
+  Generation:
+    Type: String
+    Default: '1'
+    Description: >-
+      Opaque marker embedded in UserData. Bumping it is what makes the launch
+      template a new version and so triggers the rolling update; it changes
+      nothing else about the instance.
+  SignalExitCode:
+    Type: String
+    Default: '0'
+    AllowedValues: ['0', '1']
+    Description: >-
+      '0' makes instances signal SUCCESS; '1' makes them signal FAILURE, which
+      must make CloudFormation cancel the rolling update and roll the stack
+      back.
+  DesiredCapacity:
+    Type: String
+    Default: '3'
+    Description: Instances the group holds at rest, and the CreationPolicy signal count.
+  MinInstancesInService:
+    Type: String
+    Default: '1'
+    Description: >-
+      UpdatePolicy floor. Must be less than MaxSize. Deliberately set BELOW
+      DesiredCapacity - MaxBatchSize so the two constraints are separately
+      falsifiable: this value alone would permit two instances out at once.
+  MaxBatchSize:
+    Type: String
+    Default: '1'
+    Description: Maximum instances CloudFormation may replace simultaneously.
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.172.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'sim2real-xsvc-ru-vpc-${AWS::StackName}'
+        - Key: 'sim2real:managed'
+          Value: 'true'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: 'sim2real:managed'
+          Value: 'true'
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.172.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: 'sim2real:managed'
+          Value: 'true'
+
+  SubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetA
+      RouteTableId: !Ref RouteTable
+
+  SignalRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: signal-this-stack-only
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: cloudformation:SignalResource
+                Resource: !Ref AWS::StackId
+      Tags:
+        - Key: 'sim2real:managed'
+          Value: 'true'
+
+  SignalInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref SignalRole
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Ref LaunchTemplateName
+      LaunchTemplateData:
+        ImageId: !Ref ImageId
+        InstanceType: t3.micro
+        IamInstanceProfile:
+          Arn: !GetAtt SignalInstanceProfile.Arn
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: 'sim2real:managed'
+                Value: 'true'
+              - Key: 'sim2real:prefix'
+                Value: sim2real-xsvc
+          - ResourceType: volume
+            Tags:
+              - Key: 'sim2real:managed'
+                Value: 'true'
+              - Key: 'sim2real:prefix'
+                Value: sim2real-xsvc
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # generation=${Generation} signal=${SignalExitCode}
+            # The generation marker above is the only thing that changes between the
+            # check's successful updates; it makes this UserData -- and therefore the
+            # launch template version, and therefore the group's LaunchTemplate
+            # property -- new, which is a documented rolling-update trigger.
+            set -u
+            TOKEN=$(curl -sS -m 10 -X PUT "http://169.254.169.254/latest/api/token" \
+              -H "X-aws-ec2-metadata-token-ttl-seconds: 300" || echo "")
+            IID=$(curl -sS -m 10 -H "X-aws-ec2-metadata-token: ${!TOKEN}" \
+              http://169.254.169.254/latest/meta-data/instance-id || echo "")
+            if [ "${SignalExitCode}" = "0" ]; then
+              STATUS=SUCCESS
+            else
+              STATUS=FAILURE
+            fi
+            # Bounded retry: the instance profile can take a few seconds to be usable,
+            # and a single failed call would strand the stack until PauseTime expires.
+            for _ in $(seq 1 30); do
+              if aws cloudformation signal-resource \
+                   --region ${AWS::Region} \
+                   --stack-name ${AWS::StackName} \
+                   --logical-resource-id AutoScalingGroup \
+                   --unique-id "${!IID}" \
+                   --status "${!STATUS}"; then
+                exit 0
+              fi
+              sleep 10
+            done
+            exit 1
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: DefaultRoute
+    Properties:
+      AutoScalingGroupName: !Ref AsgName
+      MinSize: '1'
+      MaxSize: '4'
+      DesiredCapacity: !Ref DesiredCapacity
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 0
+      VPCZoneIdentifier:
+        - !Ref SubnetA
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: 'sim2real:managed'
+          Value: 'true'
+          PropagateAtLaunch: true
+        - Key: 'sim2real:prefix'
+          Value: sim2real-xsvc
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        # Every instance must signal, so CREATE_COMPLETE is itself proof that the
+        # signal path works end to end -- the positive control for the rollback leg.
+        Count: !Ref DesiredCapacity
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: !Ref MaxBatchSize
+        MinInstancesInService: !Ref MinInstancesInService
+        MinSuccessfulInstancesPercent: 100
+        PauseTime: PT15M
+        WaitOnResourceSignals: true
+        # Recommended by the UpdatePolicy documentation: these processes would
+        # otherwise race the rolling update and could relaunch a batch CloudFormation
+        # is deliberately holding out of service.
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - AlarmNotification
+          - ScheduledActions
+
+Outputs:
+  AsgNameOut:
+    Value: !Ref AutoScalingGroup
+  VpcId:
+    Value: !Ref Vpc
+  SubnetAId:
+    Value: !Ref SubnetA
+  LaunchTemplateId:
+    Value: !Ref LaunchTemplate
+  LaunchTemplateLatestVersion:
+    Value: !GetAtt LaunchTemplate.LatestVersionNumber

@@ -1,0 +1,25 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  FunctionName:
+    Type: String
+Resources:
+  Fn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Runtime: python3.13
+      Handler: index.handler
+      InlineCode: |
+        def handler(event, context):
+            return None
+      Events:
+        Tick:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 day)
+        Paused:
+          Type: Schedule
+          Properties:
+            Schedule: rate(7 days)
+            Enabled: false

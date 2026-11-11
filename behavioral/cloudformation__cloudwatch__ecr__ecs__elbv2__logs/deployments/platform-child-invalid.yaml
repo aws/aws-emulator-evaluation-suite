@@ -1,0 +1,31 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  A child stack with exactly one resource that CloudWatch Logs must refuse: a log group whose
+  RetentionInDays is not one of the accepted values.
+
+# WHY THE BAD VALUE ARRIVES AS A PARAMETER.
+# CloudWatch Logs accepts retentions from a fixed set (1, 3, 5, 7, 14, 30, ... 3653). A literal 4 in the
+# template could be rejected during template VALIDATION, which would fail the parent's CreateStack call
+# outright and leave no rollback to observe. Passed as a Ref, the value cannot be evaluated until the
+# resource is provisioned, so the failure lands where the check needs it: a resource-level CREATE_FAILED
+# inside a nested stack, whose reason names retentionInDays, which then has to roll the PARENT back.
+#
+# The log group name is derived from the sibling child's output, so this child also proves the
+# parent -> child parameter hop happened before the failure.
+
+Parameters:
+  LogGroupName:
+    Type: String
+  BadRetentionDays:
+    Type: Number
+
+Resources:
+  Rejected:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '${LogGroupName}-rejected'
+      RetentionInDays: !Ref BadRetentionDays
+
+Outputs:
+  RejectedLogGroupName:
+    Value: !Ref Rejected

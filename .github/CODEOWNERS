@@ -1,0 +1,2 @@
+# Changes to CI and repository settings files need a review from the owning team.
+/.github/ @aws/sync-team-awsemulator

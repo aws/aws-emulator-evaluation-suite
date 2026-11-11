@@ -1,0 +1,60 @@
+"""stop-search-job-transitions-to-stopped."""
+from __future__ import annotations
+
+import time
+
+from behavioral_harness import tags
+from botocore.exceptions import ClientError
+
+CHECK = "stop-search-job-transitions-to-stopped"
+GROUP = "state-machine"
+SERVICES = ["backupsearch"]
+
+
+@tags("axis:happy-path", "cap:c4", "concern:representation", "plane:control")
+def run(ctx) -> None:
+    """Stopping a just-started (RUNNING) search job drives it through STOPPING to a terminal
+    STOPPED status, per the documented RUNNING -> STOPPING -> STOPPED transition."""
+    bs = ctx.client("backupsearch")
+    started = bs.start_search_job(
+        Name=ctx.unique_name("sim2real-behav-searchjob-"),
+        SearchScope={"BackupResourceTypes": ["S3"]},
+        Tags={"sim2real": CHECK},
+    )
+    job_id = started["SearchJobIdentifier"]
+    ctx.on_cleanup(lambda: _best_effort_stop(bs, job_id))
+
+    # Stop immediately, minimizing the race window against the job's own completion.
+    bs.stop_search_job(SearchJobIdentifier=job_id)
+
+    final = _poll_until(
+        lambda: bs.get_search_job(SearchJobIdentifier=job_id),
+        lambda r: r["Status"] in ("STOPPED", "COMPLETED", "FAILED"),
+        timeout_s=120.0,
+        interval_s=2.0,
+    )
+    assert final["Status"] == "STOPPED", f"expected STOPPED, got {final['Status']!r}: {final}"
+
+
+def _poll_until(probe, predicate, *, timeout_s=60.0, interval_s=2.0):
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while time.monotonic() < deadline:
+        last = probe()
+        if predicate(last):
+            return last
+        time.sleep(interval_s)
+    raise AssertionError(f"condition not met within {timeout_s}s; last value={last!r}")
+
+
+def _best_effort_stop(bs, job_id: str) -> None:
+    try:
+        bs.stop_search_job(SearchJobIdentifier=job_id)
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ResourceNotFoundException":
+            raise
+
+
+if __name__ == "__main__":
+    from fidelity_tests_runner import main
+    main(run)

@@ -1,0 +1,21 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  FunctionName:
+    Type: String
+  Reply:
+    Type: String
+  CodeSha:
+    Type: String
+Resources:
+  Fn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Runtime: python3.13
+      Handler: index.handler
+      AutoPublishAlias: live
+      AutoPublishCodeSha256: !Ref CodeSha
+      InlineCode: !Sub |
+        def handler(event, context):
+            return {"reply": "${Reply}"}

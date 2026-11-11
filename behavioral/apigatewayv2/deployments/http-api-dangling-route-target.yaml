@@ -1,0 +1,61 @@
+AWSTemplateFormatVersion: '2010-09-09'
+# sim2real: an HTTP API, a target-less route "GET /ok", and a second route "GET /bad" whose Target is
+# the only thing the `TargetMode` parameter moves:
+#
+#   dangling  Target "integrations/nonexistent" -- an integration that is never created anywhere.
+#             CreateRoute refuses it, the stack fails, and create-rollback deletes the Api.
+#   real      the positive control: an HTTP_PROXY integration is created in the same stack and the
+#             route targets it, so the identical template shape reaches CREATE_COMPLETE.
+#
+# Nothing else differs between the two modes, so a rollback is attributable to the dangling target.
+Description: sim2real HTTP API whose second route targets a never-created integration (create-rollback).
+
+Parameters:
+  TargetMode:
+    Type: String
+    AllowedValues: [dangling, real]
+  ApiName:
+    Type: String
+
+Conditions:
+  WithRealIntegration: !Equals [!Ref TargetMode, real]
+
+Resources:
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Ref ApiName
+      ProtocolType: HTTP
+      Description: sim2real dangling-route-target rollback
+      Tags:
+        sim2real:managed: 'true'
+
+  RealIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: WithRealIntegration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: GET
+      IntegrationUri: https://example.com/
+      PayloadFormatVersion: '1.0'
+
+  OkRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /ok
+
+  BadRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /bad
+      Target: !If
+        - WithRealIntegration
+        - !Join ['/', [integrations, !Ref RealIntegration]]
+        - integrations/nonexistent
+
+Outputs:
+  ApiIdOut:
+    Value: !Ref HttpApi

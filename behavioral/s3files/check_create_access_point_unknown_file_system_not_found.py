@@ -1,0 +1,180 @@
+"""create-access-point-unknown-file-system-not-found."""
+from __future__ import annotations
+
+import json
+import time
+
+from botocore.exceptions import ClientError
+
+from behavioral_harness import tags
+
+CHECK = "create-access-point-unknown-file-system-not-found"
+GROUP = "error-semantics"
+SERVICES = ["s3files"]
+
+
+@tags("axis:rejection", "cap:c1", "concern:negative-classes", "plane:control")
+def run(ctx) -> None:
+    """CreateAccessPoint against a well-formed but nonexistent fileSystemId is rejected with
+    ResourceNotFoundException; the identical call against a real file system succeeds."""
+    s3files = ctx.client("s3files")
+    bucket = _create_versioned_bucket(ctx)
+    role_arn = _create_s3files_role(ctx, bucket["name"])
+    fs_id = _create_and_wait_available(ctx, bucket["arn"], role_arn)
+    bogus_fs_id = "fs-" + "0" * 17
+
+    code, message = _error(lambda: s3files.create_access_point(
+        fileSystemId=bogus_fs_id,
+        posixUser={"uid": 1000, "gid": 1000},
+        rootDirectory={"path": "/"},
+    ))
+    assert code == "ResourceNotFoundException", f"expected ResourceNotFoundException, got {code!r}"
+    assert message == "File system does not exist.", f"expected message 'File system does not exist.', got {message!r}"
+
+    # Effect absent: the rejected call created nothing under a file system that does exist.
+    aps = s3files.list_access_points(fileSystemId=fs_id)["accessPoints"]
+    assert aps == [], f"expected no access point to exist yet, got {aps}"
+
+    # Positive control: the identical call against the real file system succeeds, proving the
+    # rejection above is specific to the unknown fileSystemId and not a blanket refusal.
+    created = s3files.create_access_point(
+        fileSystemId=fs_id,
+        posixUser={"uid": 1000, "gid": 1000},
+        rootDirectory={"path": "/"},
+    )
+    ap_id = created["accessPointId"]
+    ctx.on_cleanup(lambda: s3files.delete_access_point(accessPointId=ap_id))
+
+    # Terminal read: independent of the mutating call, at the destination.
+    fetched = s3files.get_access_point(accessPointId=ap_id)
+    assert fetched["fileSystemId"] == fs_id, (
+        f"expected the positive control's access point to belong to {fs_id!r}, got {fetched['fileSystemId']!r}"
+    )
+
+
+def _error(fn):
+    """Return the (code, message) of the ClientError ``fn`` raises; a success is an AssertionError."""
+    try:
+        result = fn()
+    except ClientError as err:
+        return err.response["Error"]["Code"], err.response["Error"].get("Message")
+    raise AssertionError(f"expected the call to be rejected, but it SUCCEEDED and returned {result!r}")
+
+
+def _poll_until(probe, predicate, *, timeout_s=180.0, interval_s=3.0):
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while time.monotonic() < deadline:
+        last = probe()
+        if predicate(last):
+            return last
+        time.sleep(interval_s)
+    raise AssertionError(f"condition not met within {timeout_s}s; last={last!r}")
+
+
+def _delete_file_system_and_wait(s3files, fs_id, *, timeout_s=300.0, interval_s=5.0):
+    """Teardown: delete the file system, tolerating not-found, and wait until it is gone so its bucket can go."""
+    try:
+        s3files.delete_file_system(fileSystemId=fs_id)
+    except ClientError as err:
+        if err.response["Error"]["Code"] == "ResourceNotFoundException":
+            return
+        raise
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            s3files.get_file_system(fileSystemId=fs_id)
+        except ClientError as err:
+            if err.response["Error"]["Code"] == "ResourceNotFoundException":
+                return
+            raise
+        time.sleep(interval_s)
+    raise AssertionError(f"file system {fs_id} still present {timeout_s}s after delete")
+
+
+def _create_versioned_bucket(ctx):
+    s3 = ctx.client("s3")
+    name = ctx.unique_name("sim2real-s3files-")
+    kwargs = {"Bucket": name}
+    if ctx.region != "us-east-1":
+        kwargs["CreateBucketConfiguration"] = {"LocationConstraint": ctx.region}
+    s3.create_bucket(**kwargs)
+    s3.put_bucket_versioning(Bucket=name, VersioningConfiguration={"Status": "Enabled"})
+
+    def _cleanup():
+        paginator = s3.get_paginator("list_object_versions")
+        for page in paginator.paginate(Bucket=name):
+            objs = [{"Key": v["Key"], "VersionId": v["VersionId"]} for v in page.get("Versions", [])]
+            objs += [{"Key": v["Key"], "VersionId": v["VersionId"]} for v in page.get("DeleteMarkers", [])]
+            if objs:
+                s3.delete_objects(Bucket=name, Delete={"Objects": objs})
+        s3.delete_bucket(Bucket=name)
+
+    ctx.on_cleanup(_cleanup)
+    return {"name": name, "arn": f"arn:aws:s3:::{name}"}
+
+
+def _create_s3files_role(ctx, bucket_name):
+    iam = ctx.client("iam")
+    sts = ctx.client("sts")
+    account_id = sts.get_caller_identity()["Account"]
+    role_name = ctx.unique_name("sim2real-s3files-role-")
+    trust = {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "AllowS3FilesAssumeRole",
+            "Effect": "Allow",
+            "Principal": {"Service": "elasticfilesystem.amazonaws.com"},
+            "Action": "sts:AssumeRole",
+            "Condition": {"StringEquals": {"aws:SourceAccount": account_id}},
+        }],
+    }
+    role_arn = iam.create_role(RoleName=role_name, AssumeRolePolicyDocument=json.dumps(trust))["Role"]["Arn"]
+    ctx.on_cleanup(lambda: iam.delete_role(RoleName=role_name))
+    policy_doc = {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "S3Access",
+            "Effect": "Allow",
+            "Action": ["s3:ListBucket", "s3:ListBucketVersions", "s3:GetObject*", "s3:PutObject*",
+                       "s3:DeleteObject*", "s3:AbortMultipartUpload"],
+            "Resource": [f"arn:aws:s3:::{bucket_name}", f"arn:aws:s3:::{bucket_name}/*"],
+        }],
+    }
+    iam.put_role_policy(RoleName=role_name, PolicyName="s3files-access", PolicyDocument=json.dumps(policy_doc))
+    ctx.on_cleanup(lambda: iam.delete_role_policy(RoleName=role_name, PolicyName="s3files-access"))
+    return role_arn
+
+
+def _create_and_wait_available(ctx, bucket_arn, role_arn, **kwargs):
+    s3files = ctx.client("s3files")
+    deadline = time.monotonic() + 60.0
+    last_err = None
+    resp = None
+    while time.monotonic() < deadline:
+        try:
+            resp = s3files.create_file_system(bucket=bucket_arn, roleArn=role_arn, **kwargs)
+            break
+        except ClientError as err:
+            code = err.response["Error"]["Code"]
+            if code in ("ResourceNotFoundException", "ValidationException"):
+                last_err = err
+                time.sleep(3)
+                continue
+            raise
+    if resp is None:
+        raise last_err
+    fs_id = resp["fileSystemId"]
+    ctx.on_cleanup(lambda: _delete_file_system_and_wait(s3files, fs_id))
+    _poll_until(
+        lambda: s3files.get_file_system(fileSystemId=fs_id)["status"],
+        lambda s: s == "available",
+        timeout_s=300.0,
+        interval_s=5.0,
+    )
+    return fs_id
+
+
+if __name__ == "__main__":
+    from fidelity_tests_runner import main
+    main(run)

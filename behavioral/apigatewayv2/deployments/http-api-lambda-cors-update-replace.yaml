@@ -1,0 +1,158 @@
+AWSTemplateFormatVersion: '2010-09-09'
+# sim2real: an HTTP API (ProtocolType HTTP) with a CorsConfiguration, an inline-Python Lambda behind
+# an AWS_PROXY integration (PayloadFormatVersion 2.0), a "GET /a" route and a $default stage with
+# AutoDeploy. The single `Phase` parameter is the only lever the owning check moves:
+#
+#   cors      the create: CORS configured, Description "sim2real phase cors".
+#   nocors    update #1: Description changed and CorsConfiguration REMOVED. Every other property is
+#             untouched, so the Api must be updated IN PLACE (same physical ApiId).
+#   replaced  update #2: the Api resource is swapped from logical id CorsApi to ReplacementApi. A
+#             dependent can never force its parent to be replaced in CloudFormation (replacement
+#             propagates from a resource to the things that Ref it, not the other way), so the way a
+#             Route change "creates a new Api" is this: the Route's ApiId -- a property whose update
+#             requires Replacement -- now Refs a NEW Api resource, CloudFormation creates that Api,
+#             replaces the Route/Integration/Stage/Permission onto it, and deletes the old Api in the
+#             UPDATE_COMPLETE_CLEANUP_IN_PROGRESS phase.
+#
+# The Lambda's execution role deliberately grants NO CloudWatch Logs permissions, so invoking it can
+# never create a /aws/lambda/<fn> log group that would outlive the stack.
+#
+Description: sim2real HTTP API + Lambda AWS_PROXY + CORS; Phase drives in-place update then Api replacement.
+
+Parameters:
+  Phase:
+    Type: String
+    AllowedValues: [cors, nocors, replaced]
+    Default: cors
+  ApiName:
+    Type: String
+  FunctionName:
+    Type: String
+  RoleName:
+    Type: String
+  AllowedOrigin:
+    Type: String
+
+Conditions:
+  WithCors: !Equals [!Ref Phase, cors]
+  UseReplacementApi: !Equals [!Ref Phase, replaced]
+  UseCorsApi: !Not [!Condition UseReplacementApi]
+
+Resources:
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Path: /sim2real/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: sim2real:managed
+          Value: 'true'
+
+  EchoFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt ExecutionRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import json
+
+
+          def lambda_handler(event, context):
+              rc = event.get("requestContext") or {}
+              return {
+                  "statusCode": 200,
+                  "headers": {"Content-Type": "application/json"},
+                  "body": json.dumps({
+                      "marker": "sim2real-cfn-httpapi-ok",
+                      "routeKey": rc.get("routeKey"),
+                      "version": event.get("version"),
+                  }),
+              }
+      Tags:
+        - Key: sim2real:managed
+          Value: 'true'
+
+  CorsApi:
+    Type: AWS::ApiGatewayV2::Api
+    Condition: UseCorsApi
+    Properties:
+      Name: !Ref ApiName
+      ProtocolType: HTTP
+      Description: !If [WithCors, sim2real phase cors, sim2real phase nocors]
+      CorsConfiguration: !If
+        - WithCors
+        - AllowOrigins:
+            - !Ref AllowedOrigin
+          AllowMethods:
+            - GET
+          AllowHeaders:
+            - content-type
+          MaxAge: 300
+        - !Ref AWS::NoValue
+      Tags:
+        sim2real:managed: 'true'
+
+  ReplacementApi:
+    Type: AWS::ApiGatewayV2::Api
+    Condition: UseReplacementApi
+    Properties:
+      Name: !Ref ApiName
+      ProtocolType: HTTP
+      Description: sim2real phase replaced
+      Tags:
+        sim2real:managed: 'true'
+
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt EchoFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub
+        - 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Id}/*/*'
+        - Id: !If [UseReplacementApi, !Ref ReplacementApi, !Ref CorsApi]
+
+  EchoIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !If [UseReplacementApi, !Ref ReplacementApi, !Ref CorsApi]
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt EchoFunction.Arn
+      IntegrationMethod: POST
+      PayloadFormatVersion: '2.0'
+
+  RouteA:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !If [UseReplacementApi, !Ref ReplacementApi, !Ref CorsApi]
+      RouteKey: GET /a
+      Target: !Join ['/', [integrations, !Ref EchoIntegration]]
+
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !If [UseReplacementApi, !Ref ReplacementApi, !Ref CorsApi]
+      StageName: $default
+      AutoDeploy: true
+      Tags:
+        sim2real:managed: 'true'
+
+Outputs:
+  ApiIdOut:
+    Value: !If [UseReplacementApi, !Ref ReplacementApi, !Ref CorsApi]
+  ApiLogicalIdOut:
+    Value: !If [UseReplacementApi, ReplacementApi, CorsApi]
+  FunctionNameOut:
+    Value: !Ref EchoFunction

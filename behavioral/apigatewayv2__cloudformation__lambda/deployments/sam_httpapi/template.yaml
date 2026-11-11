@@ -1,0 +1,43 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  FunctionName:
+    Type: String
+  AllowedOrigin:
+    Type: String
+Globals:
+  Function:
+    Runtime: python3.13
+    Handler: index.handler
+    MemorySize: 192
+  HttpApi:
+    CorsConfiguration:
+      AllowOrigins:
+        - !Ref AllowedOrigin
+      AllowMethods:
+        - GET
+Resources:
+  Api:
+    Type: AWS::Serverless::HttpApi
+  Fn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      InlineCode: |
+        import json
+
+
+        def handler(event, context):
+            body = {k: event.get(k) for k in ("version", "routeKey", "rawPath")}
+            return {"statusCode": 200, "headers": {"content-type": "application/json"},
+                    "body": json.dumps(body)}
+      Events:
+        Hello:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /hello
+            Method: GET
+Outputs:
+  Endpoint:
+    Value: !GetAtt Api.ApiEndpoint

@@ -1,0 +1,112 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  DynamoDB Streams -> Lambda pipeline. CloudFormation must resolve the source
+  table's StreamArn via !GetAtt and wire it into an enabled event source mapping.
+
+Parameters:
+  SourceTableName:
+    Type: String
+  SinkTableName:
+    Type: String
+
+Resources:
+  SourceTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref SourceTableName
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  SinkTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref SinkTableName
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StreamConsumerAndSinkWrite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:DescribeStream
+                  - dynamodb:ListStreams
+                Resource: !GetAtt SourceTable.StreamArn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt SinkTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  StreamProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          SINK_TABLE: !Ref SinkTable
+      Code:
+        ZipFile: |
+          import boto3, os
+          ddb = boto3.client("dynamodb")
+          SINK_TABLE = os.environ["SINK_TABLE"]
+          def handler(event, context):
+              for record in event.get("Records", []):
+                  if record.get("eventName") == "INSERT":
+                      pk = record["dynamodb"]["NewImage"].get("pk", {}).get("S", "unknown")
+                      ddb.put_item(TableName=SINK_TABLE, Item={
+                          "pk": {"S": f"processed-{pk}"},
+                          "source": {"S": "ddb-stream"}
+                      })
+              return {"ok": True}
+
+  StreamEsm:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt SourceTable.StreamArn
+      FunctionName: !Ref StreamProcessor
+      StartingPosition: TRIM_HORIZON
+      BatchSize: 1
+      Enabled: true
+
+Outputs:
+  StreamArnOut:
+    Value: !GetAtt SourceTable.StreamArn
+  EsmIdOut:
+    Value: !Ref StreamEsm
+  FunctionNameOut:
+    Value: !Ref StreamProcessor

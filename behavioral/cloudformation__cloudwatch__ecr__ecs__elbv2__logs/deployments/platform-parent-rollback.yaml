@@ -1,0 +1,56 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  The failure-injection parent: one child that succeeds and one that cannot, so a child-level failure
+  has to roll the whole parent back and take the SUCCESSFUL child's resources with it.
+
+# It reuses platform-observability.yaml unchanged as the succeeding child, and its log group name still
+# travels child -> parent -> child (into the failing child's Parameters), so the cross-stack hop is
+# exercised on the failure path too. Only the small children are used: the point is the rollback
+# semantics, and provisioning a load balancer and an ECS service in order to throw them away would add
+# ten minutes and nothing to the assertion.
+
+Parameters:
+  ObservabilityTemplateUrl:
+    Type: String
+  FailingTemplateUrl:
+    Type: String
+  LogGroupName:
+    Type: String
+  RetentionDays:
+    Type: Number
+    Default: 7
+  MetricNamespace:
+    Type: String
+  MetricName:
+    Type: String
+  AlarmName:
+    Type: String
+  BadRetentionDays:
+    Type: Number
+    Description: An invalid CloudWatch Logs retention. See platform-child-invalid.yaml.
+
+Resources:
+  ObservabilityStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Ref ObservabilityTemplateUrl
+      Parameters:
+        LogGroupName: !Ref LogGroupName
+        RetentionDays: !Ref RetentionDays
+        MetricNamespace: !Ref MetricNamespace
+        MetricName: !Ref MetricName
+        AlarmName: !Ref AlarmName
+
+  FailingStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - ObservabilityStack
+    Properties:
+      TemplateURL: !Ref FailingTemplateUrl
+      Parameters:
+        LogGroupName: !GetAtt ObservabilityStack.Outputs.LogGroupNameOut
+        BadRetentionDays: !Ref BadRetentionDays
+
+Outputs:
+  LogGroupNameOut:
+    Value: !GetAtt ObservabilityStack.Outputs.LogGroupNameOut

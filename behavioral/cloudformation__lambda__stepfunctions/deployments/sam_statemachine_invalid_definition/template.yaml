@@ -1,0 +1,29 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  FunctionName:
+    Type: String
+  StateMachineName:
+    Type: String
+Resources:
+  Fn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Runtime: python3.13
+      Handler: index.handler
+      InlineCode: |
+        def handler(event, context):
+            return {"doubled": event["n"] * 2}
+  Machine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Ref StateMachineName
+      Definition:
+        Comment: missing StartAt and States
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref Fn
+Outputs:
+  FunctionArn:
+    Value: !GetAtt Fn.Arn

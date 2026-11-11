@@ -1,0 +1,50 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  FunctionName:
+    Type: String
+  MarkerName:
+    Type: String
+Resources:
+  Dlq:
+    Type: AWS::SQS::Queue
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 5
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt Dlq.Arn
+        maxReceiveCount: 2
+  Fn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 4
+      Environment:
+        Variables:
+          MARKER: !Ref MarkerName
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: ssm:PutParameter
+              Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${MarkerName}
+      InlineCode: |
+        import os
+
+        import boto3
+
+
+        def handler(event, context):
+            body = event["Records"][0]["body"]
+            if body == "poison":
+                raise RuntimeError("simulated poison message")
+            boto3.client("ssm").put_parameter(
+                Name=os.environ["MARKER"], Value=body, Type="String", Overwrite=True)
+      Events:
+        Work:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt Queue.Arn
+            BatchSize: 1

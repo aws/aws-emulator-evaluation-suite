@@ -1,0 +1,223 @@
+"""keyspaces-target-tracking-alarms-watch-the-table-metrics."""
+from __future__ import annotations
+
+import datetime
+import time
+
+from botocore.exceptions import ClientError
+
+from behavioral_harness import tags
+
+CHECK = "keyspaces-target-tracking-alarms-watch-the-table-metrics"
+GROUP = 'scaling-policies'
+SERVICES = ['application-autoscaling']
+
+_NS = 'cassandra'
+_WRITE = 'cassandra:table:WriteCapacityUnits'
+_TARGET = 60.0
+
+
+@tags('axis:happy-path', 'cap:c1', 'concern:metrics', 'concern:representation', 'plane:control')
+def run(ctx) -> None:
+    """A target-tracking policy on a Keyspaces write dimension mints alarms on the table's
+    AWS/Cassandra metrics (Keyspace, TableName), each acting on the policy; deleting it removes all.
+    """
+    aas = ctx.client('application-autoscaling')
+    cw = ctx.client('cloudwatch')
+    keyspace, table = _keyspaces_table(ctx, read=1, write=1)
+    resource_id = f'keyspace/{keyspace}/table/{table}'
+    policy = ctx.unique_name('sim2real-behav-aas-ks-tt-')
+    # Runs after the deregistration below (LIFO), removing any alarm the cascade left.
+    ctx.on_cleanup(lambda: _delete_alarms(cw, f'TargetTracking-{resource_id}-'))
+    aas.register_scalable_target(ServiceNamespace=_NS, ResourceId=resource_id,
+                                 ScalableDimension=_WRITE, MinCapacity=1, MaxCapacity=5)
+    ctx.on_cleanup(lambda: _deregister(aas, resource_id, _WRITE))
+
+    put = aas.put_scaling_policy(
+        PolicyName=policy, ServiceNamespace=_NS, ResourceId=resource_id, ScalableDimension=_WRITE,
+        PolicyType='TargetTrackingScaling',
+        TargetTrackingScalingPolicyConfiguration={
+            'TargetValue': _TARGET,
+            'PredefinedMetricSpecification': {
+                'PredefinedMetricType': 'CassandraWriteCapacityUtilization'}})
+    names = [a['AlarmName'] for a in put['Alarms']]
+    live = _poll_until(lambda: _alarms(cw, names), lambda found: set(found) == set(names),
+                       timeout_s=60, interval_s=3.0,
+                       description='every policy alarm being visible in CloudWatch')
+    shapes = sorted(
+        (n.replace(resource_id, '<rid>').rsplit('-', 5)[0], a['Namespace'], a['MetricName'],
+         a['ComparisonOperator'])
+        for n, a in live.items())
+    expected_shapes = [
+        ('TargetTracking-<rid>-AlarmHigh', 'AWS/Cassandra', 'ConsumedWriteCapacityUnits',
+         'GreaterThanThreshold'),
+        ('TargetTracking-<rid>-AlarmLow', 'AWS/Cassandra', 'ConsumedWriteCapacityUnits',
+         'LessThanThreshold'),
+        ('TargetTracking-<rid>-CassandraProvisionedCapacityHigh', 'AWS/Cassandra',
+         'ProvisionedWriteCapacityUnits', 'GreaterThanThreshold'),
+        ('TargetTracking-<rid>-CassandraProvisionedCapacityLow', 'AWS/Cassandra',
+         'ProvisionedWriteCapacityUnits', 'LessThanThreshold'),
+    ]
+    assert shapes == expected_shapes, f'alarm set was {shapes!r}'
+    expected_dims = {'Keyspace': keyspace, 'TableName': table}
+    for name, alarm in live.items():
+        dims = {d['Name']: d['Value'] for d in alarm['Dimensions']}
+        assert dims == expected_dims, (
+            f'alarm dimensions were {sorted(dims)!r}; expected Keyspace and TableName of the '
+            f'registered table')
+        assert len(alarm['AlarmActions']) == 1 and alarm['AlarmActions'][0].startswith(
+            put['PolicyARN'] + ':createdBy/'), "the alarm's single action must be its policy"
+
+    aas.delete_scaling_policy(PolicyName=policy, ServiceNamespace=_NS, ResourceId=resource_id,
+                              ScalableDimension=_WRITE)
+    _poll_until(lambda: _alarms(cw, names), lambda found: not found, timeout_s=90,
+                interval_s=3.0, description="the policy's alarms being removed with the policy")
+
+
+def _alarms(cw, names):
+    out = {}
+    for page in cw.get_paginator('describe_alarms').paginate(AlarmNames=names):
+        for alarm in page['MetricAlarms']:
+            out[alarm['AlarmName']] = alarm
+    return out
+
+
+def _delete_alarms(cw, prefix):
+    left = []
+    for page in cw.get_paginator('describe_alarms').paginate(AlarmNamePrefix=prefix):
+        left.extend(a['AlarmName'] for a in page['MetricAlarms'])
+    if left:
+        cw.delete_alarms(AlarmNames=left)
+
+
+def _poll_until(probe, predicate, *, timeout_s, interval_s=5.0, description='condition'):
+    """Bounded retry with a deadline that RAISES on timeout, never returns its last value."""
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while time.monotonic() < deadline:
+        last = probe()
+        if predicate(last):
+            return last
+        time.sleep(interval_s)
+    raise AssertionError(f'{description} not observed within {timeout_s}s; last saw {last!r}')
+
+
+def _keyspaces_table(ctx, *, read, write):
+    """A fresh keyspace holding one PROVISIONED table, both ACTIVE; returns (keyspace, table)."""
+    ks = ctx.client('keyspaces')
+    keyspace = ctx.unique_name('sim2real_aas_ks_')
+    table = 'sim2real_t'
+    ks.create_keyspace(keyspaceName=keyspace, tags=[{'key': 'sim2real', 'value': CHECK}])
+    ctx.on_cleanup(lambda: _delete_keyspace(ks, keyspace))
+    _poll_until(lambda: _keyspace_exists(ks, keyspace), bool, timeout_s=120, interval_s=3.0,
+                description=f'keyspace {keyspace!r} becoming readable')
+    ks.create_table(
+        keyspaceName=keyspace, tableName=table,
+        schemaDefinition={'allColumns': [{'name': 'pk', 'type': 'text'}],
+                          'partitionKeys': [{'name': 'pk'}]},
+        capacitySpecification=_capacity(read, write),
+        tags=[{'key': 'sim2real', 'value': CHECK}],
+    )
+    ctx.on_cleanup(lambda: _delete_table(ks, keyspace, table))
+    _poll_until(lambda: _table_status(ks, keyspace, table),
+                lambda s: s == 'ACTIVE', timeout_s=300, interval_s=5.0,
+                description=f'table {keyspace}.{table} becoming ACTIVE')
+    return keyspace, table
+
+
+def _table_status(ks, keyspace, table):
+    """The table's status; a table not yet readable after CreateTable reads as None."""
+    try:
+        return ks.get_table(keyspaceName=keyspace, tableName=table)['status']
+    except ClientError as exc:
+        if exc.response['Error']['Code'] != 'ResourceNotFoundException':
+            raise
+        return None
+
+
+def _keyspace_exists(ks, keyspace):
+    try:
+        ks.get_keyspace(keyspaceName=keyspace)
+        return True
+    except ClientError as exc:
+        if exc.response['Error']['Code'] != 'ResourceNotFoundException':
+            raise
+        return False
+
+
+def _delete_table(ks, keyspace, table):
+    deadline = time.monotonic() + 40
+    while True:
+        try:
+            ks.delete_table(keyspaceName=keyspace, tableName=table)
+            return
+        except ClientError as exc:
+            code = exc.response['Error']['Code']
+            if code == 'ResourceNotFoundException':
+                return
+            if code != 'ConflictException' or time.monotonic() > deadline:
+                raise
+            time.sleep(3)
+
+
+def _delete_keyspace(ks, keyspace):
+    """Delete the keyspace; a table still being deleted inside it is a ConflictException."""
+    deadline = time.monotonic() + 40
+    while True:
+        try:
+            ks.delete_keyspace(keyspaceName=keyspace)
+            return
+        except ClientError as exc:
+            code = exc.response['Error']['Code']
+            if code == 'ResourceNotFoundException':
+                return
+            if code != 'ConflictException' or time.monotonic() > deadline:
+                raise
+            time.sleep(3)
+
+
+def _deregister(aas, resource_id, dimension):
+    try:
+        aas.deregister_scalable_target(ServiceNamespace=_NS, ResourceId=resource_id,
+                                       ScalableDimension=dimension)
+    except ClientError as exc:
+        if exc.response['Error']['Code'] != 'ObjectNotFoundException':
+            raise
+
+
+def _activities(aas, resource_id, dimension):
+    out, token = [], None
+    while True:
+        kwargs = {'ServiceNamespace': _NS, 'ResourceId': resource_id,
+                  'ScalableDimension': dimension}
+        if token:
+            kwargs['NextToken'] = token
+        page = aas.describe_scaling_activities(**kwargs)
+        out.extend(page['ScalingActivities'])
+        token = page.get('NextToken')
+        if not token:
+            return out
+
+
+def _next_minute_at(min_lead_s=30):
+    """A one-time at() expression for the next whole UTC minute at least ``min_lead_s`` away."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    fire = now.replace(second=0, microsecond=0) + datetime.timedelta(minutes=1)
+    if (fire - now).total_seconds() < min_lead_s:
+        fire += datetime.timedelta(minutes=1)
+    return f'at({fire:%Y-%m-%dT%H:%M:%S})', fire
+
+
+
+
+def _capacity(read, write):
+    """PROVISIONED at (read, write), or on-demand when both are None."""
+    if read is None and write is None:
+        return {'throughputMode': 'PAY_PER_REQUEST'}
+    return {'throughputMode': 'PROVISIONED', 'readCapacityUnits': read,
+            'writeCapacityUnits': write}
+
+
+if __name__ == '__main__':
+    from fidelity_tests_runner import main
+    main(run)

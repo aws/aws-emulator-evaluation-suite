@@ -1,0 +1,24 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  One SSM parameter, used as the subject of a CloudFormation stack-event notification test.
+  Deliberately minimal: the check is about the NOTIFICATIONS CloudFormation publishes while it
+  creates this resource, so the resource itself only has to be cheap, fast and have a physical id
+  the check can predict and read back.
+Parameters:
+  ParameterName:
+    Type: String
+    Description: Full SSM parameter name, supplied by the check so nothing is hardcoded.
+  ParameterValue:
+    Type: String
+    Description: Value written to the parameter, unique per run.
+Resources:
+  Notified:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Ref ParameterName
+      Type: String
+      Value: !Ref ParameterValue
+Outputs:
+  NotifiedName:
+    Description: The physical id of the parameter, for cross-checking against the notification.
+    Value: !Ref Notified

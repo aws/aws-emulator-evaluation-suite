@@ -1,0 +1,7 @@
+{
+  "app": "python3 app.py",
+  "versionReporting": false,
+  "context": {
+    "@aws-cdk/aws-autoscaling:generateLaunchTemplateInsteadOfLaunchConfig": true
+  }
+}

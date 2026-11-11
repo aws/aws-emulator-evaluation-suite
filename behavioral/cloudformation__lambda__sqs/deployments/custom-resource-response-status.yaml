@@ -1,0 +1,203 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFormation custom resource whose responder signals a PARAMETERISED Status.
+  One SQS queue is created before the custom resource so that a FAILED response
+  has something to roll back, and every lifecycle request the responder receives
+  is recorded to a second queue that lives OUTSIDE this stack, so the Delete
+  record survives teardown.
+
+Parameters:
+  RecorderQueueUrl:
+    Type: String
+    Description: URL of the externally-created queue the responder records lifecycle requests to.
+  RecorderQueueName:
+    Type: String
+    Description: Name of that same queue, used to scope the responder's send permission.
+  PartialQueueName:
+    Type: String
+    Description: >
+      Name of the in-stack queue created BEFORE the custom resource. On the FAILED leg this is
+      the resource whose physical absence proves the rollback really deleted it.
+  EchoValue:
+    Type: String
+    Description: Value the responder returns as Data.Echo, readable through Fn::GetAtt.
+  ResponseStatus:
+    Type: String
+    Default: SUCCESS
+    AllowedValues: [SUCCESS, FAILED]
+    Description: >
+      The Status the responder PUTs to the presigned ResponseURL for the Create request. This is
+      the ONE thing that differs between the positive and negative legs.
+  FailureReason:
+    Type: String
+    Default: sim2real-xsvc-custom-resource-refused
+    Description: Reason sent alongside a FAILED Create response, so it can be matched in stack events.
+
+Resources:
+  # Created before the custom resource, so a FAILED response has a completed resource to roll back.
+  PartialQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref PartialQueueName
+      MessageRetentionPeriod: 3600
+      Tags:
+        - Key: sim2real:managed
+          Value: 'true'
+        - Key: sim2real:prefix
+          Value: sim2real-xsvc
+
+  ResponderRole:
+    Type: AWS::IAM::Role
+    # No RoleName: the checks deploy with CAPABILITY_IAM only, and naming an IAM resource would
+    # require CAPABILITY_NAMED_IAM.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RecordLifecycleRequests
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${RecorderQueueName}'
+
+  Responder:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'sim2real-xsvc-cr-${AWS::StackName}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt ResponderRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          RECORDER_QUEUE_URL: !Ref RecorderQueueUrl
+      Code:
+        # Parameters reach this code through ResourceProperties and the environment, never through
+        # Fn::Sub -- so no '${...}' sequence in the Python below is at risk of being substituted.
+        ZipFile: |
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+          import uuid
+
+          import boto3
+
+          # A presigned CloudFormation ResponseURL carries its credential in the query string.
+          # SigV4 uses X-Amz-Signature/X-Amz-Credential; the older SigV2 form uses
+          # Signature/AWSAccessKeyId. Any of them means the URL was genuinely presigned.
+          _SIGNATURE_PARAMS = (
+              'X-Amz-Signature',
+              'X-Amz-Credential',
+              'Signature',
+              'AWSAccessKeyId',
+          )
+
+
+          def _url_is_signed(url):
+              query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+              return any(param in query for param in _SIGNATURE_PARAMS)
+
+
+          def _record(event, physical_id):
+              props = event.get('ResourceProperties') or {}
+              body = {
+                  'RequestType': event['RequestType'],
+                  'Echo': props.get('Echo'),
+                  'PhysicalResourceId': physical_id,
+                  'ResponseUrlSigned': _url_is_signed(event.get('ResponseURL') or ''),
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+              }
+              boto3.client('sqs').send_message(
+                  QueueUrl=os.environ['RECORDER_QUEUE_URL'],
+                  MessageBody=json.dumps(body),
+              )
+
+
+          def _respond(event, physical_id, status, reason, data):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason,
+                  'PhysicalResourceId': physical_id,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': data,
+              }).encode()
+              request = urllib.request.Request(
+                  url=event['ResponseURL'],
+                  data=body,
+                  method='PUT',
+                  headers={'Content-Type': '', 'Content-Length': str(len(body))},
+              )
+              urllib.request.urlopen(request)
+
+
+          def lambda_handler(event, context):
+              props = event.get('ResourceProperties') or {}
+              request_type = event['RequestType']
+
+              # CloudFormation sends no PhysicalResourceId on Create, so the responder mints one and
+              # CFN must adopt it; on Update and Delete it sends back the id it remembered.
+              physical_id = event.get('PhysicalResourceId')
+              if not physical_id:
+                  physical_id = 'sim2real-xsvc-cr-' + uuid.uuid4().hex[:12]
+
+              status = 'SUCCESS'
+              reason = 'sim2real responder ok'
+              # Only a Create is allowed to answer FAILED. A Delete that answered FAILED would
+              # strand the stack in DELETE_FAILED and leak every resource in it.
+              if request_type == 'Create' and props.get('ResponseStatus') == 'FAILED':
+                  status = 'FAILED'
+                  reason = props.get('FailureReason') or 'sim2real-xsvc-custom-resource-refused'
+
+              try:
+                  _record(event, physical_id)
+              except Exception as exc:  # noqa: BLE001 - must never strand the stack
+                  if request_type == 'Create':
+                      status = 'FAILED'
+                      reason = 'sim2real recorder unavailable: ' + str(exc)
+
+              try:
+                  _respond(event, physical_id, status, reason, {'Echo': props.get('Echo') or ''})
+              except Exception as exc:  # noqa: BLE001
+                  # A responder that never answers leaves CloudFormation waiting an hour, so make one
+                  # last attempt to fail fast and let the stack reach a terminal status.
+                  _respond(event, physical_id, 'FAILED', 'sim2real respond failed: ' + str(exc), {})
+                  raise
+
+  Recorded:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: PartialQueue
+    Properties:
+      ServiceToken: !GetAtt Responder.Arn
+      Echo: !Ref EchoValue
+      ResponseStatus: !Ref ResponseStatus
+      FailureReason: !Ref FailureReason
+
+Outputs:
+  EchoedByCustomResource:
+    Description: Data.Echo from the responder's Create response, read back through Fn::GetAtt.
+    Value: !GetAtt Recorded.Echo
+  CustomResourcePhysicalId:
+    Description: Ref of the custom resource, which is the PhysicalResourceId the responder minted.
+    Value: !Ref Recorded
+  PartialQueueUrl:
+    Description: The in-stack queue created before the custom resource.
+    Value: !Ref PartialQueue

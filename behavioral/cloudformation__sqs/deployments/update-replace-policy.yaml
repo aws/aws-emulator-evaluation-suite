@@ -1,0 +1,49 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Two SQS queues whose names are driven by a parameter, so changing the parameter
+  changes a CREATE-ONLY property (QueueName) and forces CloudFormation to REPLACE
+  both resources rather than update them in place. The pair differs in exactly one
+  attribute -- UpdateReplacePolicy -- so the same replacing update must retain one
+  predecessor and delete the other.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Description: >
+      Prefix for both queue names. QueueName is create-only for AWS::SQS::Queue, so
+      passing a different prefix on update is what makes the update a replacement.
+      Deploy with prefix A, update to prefix B, and compare physical ids.
+
+Resources:
+  # UpdateReplacePolicy: Retain -- the queue this update replaces must SURVIVE the
+  # replacement, messages and all, orphaned from the stack. DeletionPolicy is left at
+  # its default (Delete) so the CURRENT queue still goes away with the stack; only the
+  # replaced predecessor is retained, and the check tears that one down by name.
+  RetainedOnReplace:
+    Type: AWS::SQS::Queue
+    UpdateReplacePolicy: Retain
+    Properties:
+      QueueName: !Sub "${NamePrefix}-retain"
+      VisibilityTimeout: 43
+      MessageRetentionPeriod: 300
+
+  # No UpdateReplacePolicy: the default is Delete, so this predecessor must be gone
+  # after the replacement.
+  ReplacedNormally:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${NamePrefix}-plain"
+      VisibilityTimeout: 43
+      MessageRetentionPeriod: 300
+
+Outputs:
+  # Ref on an AWS::SQS::Queue is the queue URL, which is also its PhysicalResourceId --
+  # the value the check compares across the update to prove replacement happened.
+  RetainedOnReplaceUrl:
+    Value: !Ref RetainedOnReplace
+  RetainedOnReplaceName:
+    Value: !GetAtt RetainedOnReplace.QueueName
+  ReplacedNormallyUrl:
+    Value: !Ref ReplacedNormally
+  ReplacedNormallyName:
+    Value: !GetAtt ReplacedNormally.QueueName

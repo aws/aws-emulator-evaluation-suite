@@ -1,0 +1,85 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: S3 notification to Lambda via CFN
+
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'sim2real-xsvc-notif-lambda-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::sim2real-xsvc-notif-bucket-${AWS::StackName}/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'sim2real-xsvc-notif-fn-${AWS::StackName}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          BUCKET_NAME: !Sub 'sim2real-xsvc-notif-bucket-${AWS::StackName}'
+      Code:
+        ZipFile: |
+          import boto3, json, os, urllib
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              bucket = os.environ['BUCKET_NAME']
+              for record in event.get('Records', []):
+                  raw_key = record['s3']['object']['key']
+                  key = urllib.parse.unquote_plus(raw_key)
+                  filename = key.split('/')[-1]
+                  s3.put_object(Bucket=bucket, Key=f'processed/{filename}', Body=f'processed:{key}')
+              return {'status': 'ok'}
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::sim2real-xsvc-notif-bucket-${AWS::StackName}'
+
+  Bucket:
+    Type: AWS::S3::Bucket
+    DependsOn: LambdaPermission
+    Properties:
+      BucketName: !Sub 'sim2real-xsvc-notif-bucket-${AWS::StackName}'
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: uploads/
+            Function: !GetAtt LambdaFunction.Arn
+
+Outputs:
+  BucketName:
+    Value: !Ref Bucket
+  FunctionArn:
+    Value: !GetAtt LambdaFunction.Arn

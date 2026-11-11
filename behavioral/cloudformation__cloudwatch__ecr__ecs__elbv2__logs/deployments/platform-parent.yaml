@@ -1,0 +1,127 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Parent stack of a three-child microservice platform. Values flow parent -> child as nested-stack
+  Parameters and child -> parent as Fn::GetAtt on the nested stack's Outputs, including CHILD TO CHILD
+  (the service child's target group and log group come from its siblings, routed through here).
+
+# WHAT THIS FILE EXISTS TO EXERCISE
+#   * AWS::CloudFormation::Stack with a TemplateURL that the caller uploaded to S3 itself - there is no
+#     bootstrap bucket to assume
+#   * Fn::GetAtt <NestedStack>.Outputs.<Name> as the ONLY channel between siblings: the service child
+#     never names the network child, so an emulator that does not evaluate a nested stack's outputs
+#     cannot produce a service that is registered with the load balancer
+#   * DependsOn ordering across children - the listener and the log group must exist before the ECS
+#     service is created, and neither is in the same stack as the service
+#   * the parent's own Outputs are child GetAtts, so a caller reads the platform's address without
+#     knowing which child produced it
+
+Parameters:
+  NetworkTemplateUrl:
+    Type: String
+  ServiceTemplateUrl:
+    Type: String
+  ObservabilityTemplateUrl:
+    Type: String
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  LoadBalancerName:
+    Type: String
+  TargetGroupName:
+    Type: String
+  SecurityGroupName:
+    Type: String
+  IngressPrefixListId:
+    Type: String
+  ClusterName:
+    Type: String
+  ServiceName:
+    Type: String
+  TaskFamily:
+    Type: String
+  RepositoryName:
+    Type: String
+  ContainerImage:
+    Type: String
+  Marker:
+    Type: String
+  DesiredCount:
+    Type: Number
+    Default: 1
+  LogGroupName:
+    Type: String
+  RetentionDays:
+    Type: Number
+    Default: 7
+  MetricNamespace:
+    Type: String
+  MetricName:
+    Type: String
+  AlarmName:
+    Type: String
+
+Resources:
+  NetworkStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Ref NetworkTemplateUrl
+      Parameters:
+        VpcId: !Ref VpcId
+        SubnetIds: !Join [',', !Ref SubnetIds]
+        LoadBalancerName: !Ref LoadBalancerName
+        TargetGroupName: !Ref TargetGroupName
+        SecurityGroupName: !Ref SecurityGroupName
+        IngressPrefixListId: !Ref IngressPrefixListId
+
+  ObservabilityStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Ref ObservabilityTemplateUrl
+      Parameters:
+        LogGroupName: !Ref LogGroupName
+        RetentionDays: !Ref RetentionDays
+        MetricNamespace: !Ref MetricNamespace
+        MetricName: !Ref MetricName
+        AlarmName: !Ref AlarmName
+
+  ServiceStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - NetworkStack
+      - ObservabilityStack
+    Properties:
+      TemplateURL: !Ref ServiceTemplateUrl
+      Parameters:
+        ClusterName: !Ref ClusterName
+        ServiceName: !Ref ServiceName
+        TaskFamily: !Ref TaskFamily
+        RepositoryName: !Ref RepositoryName
+        ContainerImage: !Ref ContainerImage
+        Marker: !Ref Marker
+        DesiredCount: !Ref DesiredCount
+        SubnetIds: !Join [',', !Ref SubnetIds]
+        # child -> parent -> sibling child. Nothing else joins these three stacks.
+        TargetGroupArn: !GetAtt NetworkStack.Outputs.TargetGroupArn
+        SecurityGroupId: !GetAtt NetworkStack.Outputs.SecurityGroupId
+        LogGroupNameFromObservability: !GetAtt ObservabilityStack.Outputs.LogGroupNameOut
+
+Outputs:
+  LoadBalancerDns:
+    Value: !GetAtt NetworkStack.Outputs.LoadBalancerDns
+  TargetGroupArn:
+    Value: !GetAtt NetworkStack.Outputs.TargetGroupArn
+  SecurityGroupId:
+    Value: !GetAtt NetworkStack.Outputs.SecurityGroupId
+  LogGroupNameOut:
+    Value: !GetAtt ObservabilityStack.Outputs.LogGroupNameOut
+  AlarmNameOut:
+    Value: !GetAtt ObservabilityStack.Outputs.AlarmNameOut
+  ClusterNameOut:
+    Value: !GetAtt ServiceStack.Outputs.ClusterNameOut
+  ServiceNameOut:
+    Value: !GetAtt ServiceStack.Outputs.ServiceNameOut
+  RepositoryUri:
+    Value: !GetAtt ServiceStack.Outputs.RepositoryUri
+  TaskDefinitionArn:
+    Value: !GetAtt ServiceStack.Outputs.TaskDefinitionArn

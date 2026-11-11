@@ -1,0 +1,260 @@
+"""sagemaker-processing-job-writes-s3-output."""
+from __future__ import annotations
+
+import time
+
+from botocore.exceptions import ClientError
+
+from behavioral_harness import tags
+
+CHECK = "sagemaker-processing-job-writes-s3-output"
+GROUP = "artifact-output"
+SERVICES = ["s3", "sagemaker"]
+
+
+@tags("axis:happy-path", "cap:c2", "cap:c3", "cap:c4", "concern:data-plane", "concern:e2e", "dp:api", "plane:data")
+def run(ctx) -> None:
+    """A SageMaker processing job uploads its ProcessingOutput results to the exact S3
+    destination configured on the job, and does not write anything into the input
+    prefix or an unrelated sibling output prefix."""
+    bucket = _create_bucket(ctx)
+    role_arn = _create_sagemaker_role(
+        ctx,
+        statements=[
+            {
+                "Effect": "Allow",
+                "Action": ["s3:GetObject", "s3:ListBucket"],
+                "Resource": [f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"],
+            },
+            {"Effect": "Allow", "Action": ["s3:PutObject"], "Resource": [f"arn:aws:s3:::{bucket}/*"]},
+        ],
+    )
+
+    rows = [["r1", "1"], ["r2", "2"], ["r3", "3"]]
+    s3 = ctx.client("s3")
+    s3.put_object(Bucket=bucket, Key="processing-input/records.csv", Body=_rows_to_csv(rows).encode("utf-8"))
+
+    out_prefix = "nested/proc-results/v1/"
+    _, desc = _run_processing_job(
+        ctx,
+        role_arn=role_arn,
+        bucket=bucket,
+        input_s3_uri=f"s3://{bucket}/processing-input/records.csv",
+        output_s3_uri=f"s3://{bucket}/{out_prefix}",
+    )
+    assert desc["ProcessingJobStatus"] == "Completed", desc.get("FailureReason")
+
+    out_key = f"{out_prefix}records.csv"
+    head = s3.head_object(Bucket=bucket, Key=out_key)
+    assert head["ContentLength"] > 0, f"expected a non-empty object at {out_key}, got ContentLength={head['ContentLength']}"
+
+    # exactly one output object landed at the configured destination -- nowhere else.
+    got_out = _list_keys(ctx, bucket, out_prefix)
+    assert got_out == [out_key], f"expected only {out_key!r} under {out_prefix!r}, got {got_out!r}"
+    got_in = _list_keys(ctx, bucket, "processing-input/records.csv")
+    assert got_in == ["processing-input/records.csv"], f"expected the input object untouched, got {got_in!r}"
+    got_sibling = _list_keys(ctx, bucket, "nested/other/")
+    assert got_sibling == [], f"expected no output leaked into the unrelated sibling prefix, got {got_sibling!r}"
+
+
+# AWS-owned SageMaker built-in-container registry accounts, one fixed account per region --
+# these are AWS's own per-region literals, not this check's target region, so pinning them here
+# is correct rather than a hardcoded-region shortcut.
+SKLEARN_ACCOUNT_BY_REGION = {
+    "us-east-1": "683313688378",
+    "us-east-2": "257758044811",
+    "us-west-1": "746614075791",
+    "us-west-2": "246618743249",
+    "eu-west-1": "141502667606",
+}
+SKLEARN_IMAGE_TAG = "1.2-1-cpu-py3"
+
+PROCESSING_SCRIPT = (
+    "import csv, glob, os\n"
+    "in_dir = '/opt/ml/processing/input/data'\n"
+    "out_dir = '/opt/ml/processing/output/results'\n"
+    "os.makedirs(out_dir, exist_ok=True)\n"
+    "for path in sorted(glob.glob(os.path.join(in_dir, '*.csv'))):\n"
+    "    with open(path, newline='') as fh:\n"
+    "        rows = list(csv.reader(fh))\n"
+    "    out_rows = [r + ['PROCESSED'] for r in rows]\n"
+    "    with open(os.path.join(out_dir, os.path.basename(path)), 'w', newline='') as fh:\n"
+    "        csv.writer(fh).writerows(out_rows)\n"
+)
+
+
+def _rows_to_csv(rows) -> str:
+    return "\n".join(",".join(r) for r in rows) + "\n"
+
+
+def _sklearn_image_uri(region: str) -> str:
+    account = SKLEARN_ACCOUNT_BY_REGION.get(region)
+    if not account:
+        raise AssertionError(
+            f"no known sagemaker-scikit-learn ECR account mapped for region {region}; "
+            "extend SKLEARN_ACCOUNT_BY_REGION to enable this check there"
+        )
+    return f"{account}.dkr.ecr.{region}.amazonaws.com/sagemaker-scikit-learn:{SKLEARN_IMAGE_TAG}"
+
+
+def _create_bucket(ctx) -> str:
+    s3 = ctx.client("s3")
+    bucket = ctx.unique_name("sim2real-sm-s3-")
+    kwargs = {"Bucket": bucket}
+    if ctx.region != "us-east-1":
+        kwargs["CreateBucketConfiguration"] = {"LocationConstraint": ctx.region}
+    s3.create_bucket(**kwargs)
+    s3.put_bucket_tagging(
+        Bucket=bucket, Tagging={"TagSet": [{"Key": "sim2real", "Value": "sagemaker-processing-job-writes-s3-output"}]}
+    )
+
+    def _cleanup():
+        objs = s3.list_objects_v2(Bucket=bucket).get("Contents", [])
+        if objs:
+            failed = s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": o["Key"]} for o in objs]}).get("Errors")
+            if failed:
+                raise RuntimeError(f"DeleteObjects left {len(failed)} object(s): {failed[:3]}")
+        s3.delete_bucket(Bucket=bucket)
+
+    ctx.on_cleanup(_cleanup)
+    return bucket
+
+
+def _list_keys(ctx, bucket, prefix):
+    resp = ctx.client("s3").list_objects_v2(Bucket=bucket, Prefix=prefix)
+    return [o["Key"] for o in resp.get("Contents", [])]
+
+
+def _create_sagemaker_role(ctx, *, statements) -> str:
+    iam = ctx.client("iam")
+    role_name = ctx.unique_name("sim2real-sm-role-")
+    trust = {
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Principal": {"Service": "sagemaker.amazonaws.com"}, "Action": "sts:AssumeRole"}],
+    }
+    role_arn = iam.create_role(
+        RoleName=role_name,
+        AssumeRolePolicyDocument=_json_dumps(trust),
+        Tags=[{"Key": "sim2real", "Value": "sagemaker-processing-job-writes-s3-output"}],
+    )["Role"]["Arn"]
+    policy_name = ctx.unique_name("sim2real-sm-policy-")
+    iam.put_role_policy(
+        RoleName=role_name, PolicyName=policy_name, PolicyDocument=_json_dumps({"Version": "2012-10-17", "Statement": statements})
+    )
+
+    def _cleanup():
+        try:
+            iam.delete_role_policy(RoleName=role_name, PolicyName=policy_name)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "NoSuchEntity":
+                raise
+        try:
+            iam.delete_role(RoleName=role_name)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "NoSuchEntity":
+                raise
+
+    ctx.on_cleanup(_cleanup)
+    return role_arn
+
+
+def _json_dumps(obj) -> str:
+    import json
+
+    return json.dumps(obj)
+
+
+def _retry_role_not_ready(create_fn, *, timeout_s: float = 90.0):
+    deadline = time.monotonic() + timeout_s
+    last_exc = None
+    while time.monotonic() < deadline:
+        try:
+            return create_fn()
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ValidationException":
+                last_exc = exc
+                time.sleep(3)
+                continue
+            raise
+    raise last_exc
+
+
+def _poll_until(probe, predicate, *, timeout_s: float = 900.0, interval_s: float = 20.0):
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while time.monotonic() < deadline:
+        last = probe()
+        if predicate(last):
+            return last
+        time.sleep(interval_s)
+    raise AssertionError(f"condition not reached within {timeout_s}s; last observed={last!r}")
+
+
+def _wait_for_terminal(describe_fn, status_key, *, timeout_s: float = 900.0, interval_s: float = 20.0):
+    terminal = {"Completed", "Failed", "Stopped"}
+    return _poll_until(describe_fn, lambda resp: resp[status_key] in terminal, timeout_s=timeout_s, interval_s=interval_s)
+
+
+def _run_processing_job(ctx, *, role_arn, bucket, input_s3_uri, output_s3_uri, job_prefix="proc"):
+    sm = ctx.client("sagemaker")
+    s3 = ctx.client("s3")
+    job_name = ctx.unique_name(f"sim2real-sm-{job_prefix}-")
+    image = _sklearn_image_uri(ctx.region)
+    code_key = f"code/{job_name}/script.py"
+    s3.put_object(Bucket=bucket, Key=code_key, Body=PROCESSING_SCRIPT.encode("utf-8"))
+
+    def _create():
+        return sm.create_processing_job(
+            ProcessingJobName=job_name,
+            RoleArn=role_arn,
+            AppSpecification={
+                "ImageUri": image,
+                "ContainerEntrypoint": ["python3", "/opt/ml/processing/input/code/script.py"],
+            },
+            ProcessingInputs=[
+                {
+                    "InputName": "data",
+                    "S3Input": {
+                        "S3Uri": input_s3_uri,
+                        "LocalPath": "/opt/ml/processing/input/data",
+                        "S3DataType": "S3Prefix",
+                        "S3InputMode": "File",
+                        "S3DataDistributionType": "FullyReplicated",
+                    },
+                },
+                {
+                    "InputName": "code",
+                    "S3Input": {
+                        "S3Uri": f"s3://{bucket}/{code_key}",
+                        "LocalPath": "/opt/ml/processing/input/code",
+                        "S3DataType": "S3Prefix",
+                        "S3InputMode": "File",
+                        "S3DataDistributionType": "FullyReplicated",
+                    },
+                },
+            ],
+            ProcessingOutputConfig={
+                "Outputs": [
+                    {
+                        "OutputName": "results",
+                        "S3Output": {
+                            "S3Uri": output_s3_uri,
+                            "LocalPath": "/opt/ml/processing/output/results",
+                            "S3UploadMode": "EndOfJob",
+                        },
+                    }
+                ]
+            },
+            ProcessingResources={"ClusterConfig": {"InstanceType": "ml.m5.large", "InstanceCount": 1, "VolumeSizeInGB": 5}},
+            StoppingCondition={"MaxRuntimeInSeconds": 1200},
+        )
+
+    _retry_role_not_ready(_create)
+    desc = _wait_for_terminal(lambda: sm.describe_processing_job(ProcessingJobName=job_name), "ProcessingJobStatus")
+    return job_name, desc
+
+
+if __name__ == "__main__":
+    from fidelity_tests_runner import main
+
+    main(run)

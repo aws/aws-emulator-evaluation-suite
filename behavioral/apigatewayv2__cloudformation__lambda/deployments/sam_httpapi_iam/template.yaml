@@ -1,0 +1,39 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  FunctionName:
+    Type: String
+Resources:
+  Api:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Auth:
+        EnableIamAuthorizer: true
+  Fn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Runtime: python3.13
+      Handler: index.handler
+      InlineCode: |
+        import json
+
+
+        def handler(event, context):
+            identity = event["requestContext"]["authorizer"]["iam"]
+            body = {"accountId": identity.get("accountId"), "accessKey": identity.get("accessKey"),
+                    "userArn": identity.get("userArn")}
+            return {"statusCode": 200, "headers": {"content-type": "application/json"},
+                    "body": json.dumps(body)}
+      Events:
+        Secure:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /secure
+            Method: GET
+            Auth:
+              Authorizer: AWS_IAM
+Outputs:
+  Endpoint:
+    Value: !GetAtt Api.ApiEndpoint

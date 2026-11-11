@@ -1,0 +1,6 @@
+name: codeql-config
+
+# The fidelity tests under behavioral/ are test fixtures that run against an emulator, not shipped
+# code, so CodeQL analyzes only the runner, its tests and the workflows.
+paths-ignore:
+  - behavioral

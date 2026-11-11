@@ -1,0 +1,100 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Broken SFN permissions stack
+
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'sim2real-xsvc-broken-bucket-${AWS::StackName}'
+
+  SFNExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'sim2real-xsvc-broken-sfn-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub 'sim2real-xsvc-broken-sm-${AWS::StackName}'
+      RoleArn: !GetAtt SFNExecRole.Arn
+      DefinitionString: |
+        {
+          "StartAt": "Pass",
+          "States": {
+            "Pass": {
+              "Type": "Pass",
+              "End": true
+            }
+          }
+        }
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'sim2real-xsvc-broken-lambda-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaS3Only
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub 'arn:aws:s3:::sim2real-xsvc-broken-bucket-${AWS::StackName}/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'sim2real-xsvc-broken-fn-${AWS::StackName}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref StateMachine
+      Code:
+        ZipFile: |
+          import boto3, json, os
+          def lambda_handler(event, context):
+              sfn = boto3.client('stepfunctions')
+              try:
+                  resp = sfn.start_execution(
+                      stateMachineArn=os.environ['STATE_MACHINE_ARN'],
+                      input=json.dumps(event)
+                  )
+                  return {'status': 'started', 'executionArn': resp['executionArn']}
+              except Exception as e:
+                  return {
+                      'error': type(e).__name__,
+                      'message': str(e),
+                      'code': getattr(e, 'response', {}).get('Error', {}).get('Code', '') if hasattr(e, 'response') else ''
+                  }
+
+Outputs:
+  FunctionName:
+    Value: !Ref LambdaFunction
+  LambdaRoleName:
+    Value: !Ref LambdaRole
+  StateMachineArn:
+    Value: !Ref StateMachine

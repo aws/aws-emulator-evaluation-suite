@@ -1,0 +1,49 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Two functionally identical DynamoDB tables that differ in exactly one respect: one carries a
+  custom TableName, the other lets CloudFormation mint the physical id. Changing a table's KeySchema
+  requires replacement, so the same structural edit is legal for the unnamed table (the positive
+  control) and refused for the named one -- "If you specify a name, you cannot perform updates that
+  require replacement of this resource"
+  (https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-dynamodb-table.md).
+  Every name and key comes in as a parameter so the check owns the identifiers and nothing is
+  hardcoded.
+Parameters:
+  NamedTableName:
+    Type: String
+    Description: The custom TableName for the named table.
+  NamedKey:
+    Type: String
+    Description: Partition key attribute name for the named table; changing it forces replacement.
+  AutoKey:
+    Type: String
+    Description: Partition key attribute name for the auto-named table; changing it forces replacement.
+Resources:
+  NamedTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref NamedTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: !Ref NamedKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: !Ref NamedKey
+          KeyType: HASH
+  AutoTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: !Ref AutoKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: !Ref AutoKey
+          KeyType: HASH
+Outputs:
+  NamedTableId:
+    Description: Physical id of the named table; must not change across a refused replacement.
+    Value: !Ref NamedTable
+  AutoTableId:
+    Description: Physical id of the auto-named table; must change when it is replaced.
+    Value: !Ref AutoTable

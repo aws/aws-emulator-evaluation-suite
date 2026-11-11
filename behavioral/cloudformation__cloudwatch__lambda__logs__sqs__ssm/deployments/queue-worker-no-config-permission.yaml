@@ -1,0 +1,154 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  The failure-injection variant of queue-worker.yaml. Identical wiring; the worker role's inline
+  policy is missing exactly ONE statement - ssm:GetParameter on the config parameter.
+
+# The single removed statement is:
+#   - Effect: Allow
+#     Action: ssm:GetParameter
+#     Resource: arn:<partition>:ssm:<region>:<account>:parameter/<WorkerConfigParamName>
+#
+# Everything else - the SQS poll permissions, the log permissions, cloudwatch:PutMetricData, the
+# event source mapping - is intact, so the stack still reaches CREATE_COMPLETE and the message is
+# still delivered to the function. The divergence is INSIDE the invocation: get_parameter is denied,
+# so the handler raises before it can emit its structured line or its metric datapoint. That is what
+# makes this a delivery-plus-denial negative rather than a create-time rejection: an emulator that
+# does not evaluate the identity policy reports the same CREATE_COMPLETE and then processes the
+# message anyway, and only the pair of assertions (the AccessDenied line present, the processed line
+# and the metric datapoint absent, the message not consumed) can tell the two apart.
+
+Parameters:
+  QueueName:
+    Type: String
+  FunctionName:
+    Type: String
+  WorkerConfigParamName:
+    Type: String
+  WorkerConfigValue:
+    Type: String
+  MetricNamespace:
+    Type: String
+  MetricName:
+    Type: String
+
+Resources:
+  WorkerConfig:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Ref WorkerConfigParamName
+      Type: String
+      Value: !Ref WorkerConfigValue
+
+  WorkQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref QueueName
+      VisibilityTimeout: 30
+      MessageRetentionPeriod: 3600
+
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${FunctionName}'
+      RetentionInDays: 1
+
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: worker
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt WorkQueue.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${FunctionName}:*'
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+
+  WorkerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - WorkerLogGroup
+    Properties:
+      FunctionName: !Ref FunctionName
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt WorkerRole.Arn
+      Environment:
+        Variables:
+          CONFIG_PARAM: !Ref WorkerConfigParamName
+          LOG_LEVEL: INFO
+          METRIC_NAMESPACE: !Ref MetricNamespace
+          METRIC_NAME: !Ref MetricName
+          WORKER_ID: !Ref FunctionName
+      Code:
+        ZipFile: |
+          import json
+          import os
+
+          import boto3
+
+          cw = boto3.client('cloudwatch')
+          ssm = boto3.client('ssm')
+
+
+          def handler(event, context):
+              cfg = ssm.get_parameter(Name=os.environ['CONFIG_PARAM'])['Parameter']['Value']
+              n = 0
+              for rec in event.get('Records', []):
+                  print(json.dumps({
+                      'event': 'work.processed',
+                      'level': os.environ['LOG_LEVEL'],
+                      'messageId': rec['messageId'],
+                      'body': rec['body'],
+                      'config': cfg,
+                      'requestId': context.aws_request_id,
+                  }))
+                  n += 1
+              cw.put_metric_data(
+                  Namespace=os.environ['METRIC_NAMESPACE'],
+                  MetricData=[{
+                      'MetricName': os.environ['METRIC_NAME'],
+                      'Dimensions': [{'Name': 'Worker', 'Value': os.environ['WORKER_ID']}],
+                      'Value': n,
+                      'Unit': 'Count',
+                  }],
+              )
+              return {'processed': n}
+
+  WorkerEsm:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt WorkQueue.Arn
+      FunctionName: !Ref WorkerFunction
+      BatchSize: 1
+      Enabled: true
+
+Outputs:
+  QueueUrl:
+    Value: !Ref WorkQueue
+  QueueArn:
+    Value: !GetAtt WorkQueue.Arn
+  WorkerFunctionName:
+    Value: !Ref WorkerFunction
+  LogGroupName:
+    Value: !Ref WorkerLogGroup

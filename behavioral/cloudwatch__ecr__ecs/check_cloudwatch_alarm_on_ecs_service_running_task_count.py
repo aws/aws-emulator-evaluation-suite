@@ -1,0 +1,256 @@
+"""cloudwatch-alarm-on-ecs-service-running-task-count."""
+from __future__ import annotations
+
+import json
+import time
+from typing import Any
+
+from behavioral_harness import tags
+from botocore.exceptions import ClientError
+
+CHECK = "cloudwatch-alarm-on-ecs-service-running-task-count"
+GROUP = "metrics-delivery"
+SERVICES = ["cloudwatch", "ecr", "ecs"]
+
+EXEC_POLICY_ARN = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+
+
+# timing:real-time — metric: 60 s https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Container-Insights-metrics-ECS.html
+@tags("axis:happy-path", "cap:c3", "cap:c4", "concern:data-plane", "concern:e2e", "concern:metrics", "dp:api", "plane:data", "timing:real-time")
+def run(ctx) -> None:
+    """An alarm on ECS/ContainerInsights RunningTaskCount, created before the metric has data,
+    records a StateUpdate into OK once the service runs a task and Container Insights publishes
+    its count: the alarm tracks the service's real task count."""
+    cw = ctx.client("cloudwatch")
+    subnets, sgs = _default_network(ctx)
+    role_arn = _create_execution_role(ctx)
+    cluster = _create_cluster(ctx, insights=True)
+
+    alarm_name = ctx.unique_name("sim2real-alarm-running-task-count-")
+    service_name_placeholder = ctx.unique_name("sim2real-svc-")
+    cw.put_metric_alarm(
+        AlarmName=alarm_name,
+        Namespace="ECS/ContainerInsights",
+        MetricName="RunningTaskCount",
+        Dimensions=[
+            {"Name": "ServiceName", "Value": service_name_placeholder},
+            {"Name": "ClusterName", "Value": cluster},
+        ],
+        Statistic="Maximum",
+        Period=60,
+        EvaluationPeriods=1,
+        Threshold=1,
+        ComparisonOperator="LessThanThreshold",
+        TreatMissingData="breaching",
+    )
+    ctx.on_cleanup(lambda: cw.delete_alarms(AlarmNames=[alarm_name]))
+
+    task_def_arn, _ = _register_task_def(
+        ctx, role_arn, command=["sh", "-c", "while true; do sleep 5; done"]
+    )
+    service = _create_service(
+        ctx, cluster, task_def_arn, subnets, sgs, desired_count=1, service_name=service_name_placeholder
+    )
+    _wait_for_running_tasks(ctx, cluster, service, 1, timeout_s=150)
+
+    state = _poll_until(
+        lambda: cw.describe_alarms(AlarmNames=[alarm_name])["MetricAlarms"][0]["StateValue"],
+        lambda s: s == "OK",
+        timeout_s=150,
+        interval_s=10,
+    )
+    assert state == "OK", f"alarm never reached OK once the service had a real running task (state={state})"
+
+    history = cw.describe_alarm_history(AlarmName=alarm_name, HistoryItemType="StateUpdate")["AlarmHistoryItems"]
+    summaries = [h["HistorySummary"] for h in history]
+    assert history, (
+        "alarm never recorded a StateUpdate transition even though it reached OK — expected at least "
+        "one transition driven by the real ECS/ContainerInsights RunningTaskCount datapoint arriving"
+    )
+    assert any("to OK" in s or "OK" in s for s in summaries), (
+        f"alarm history has no transition into OK once the running task's metric arrived: {summaries}"
+    )
+
+
+# ===== helpers =====
+
+def _default_network(ctx) -> tuple[list[str], list[str]]:
+    ec2 = ctx.client("ec2")
+    vpcs = ec2.describe_vpcs(Filters=[{"Name": "vpc-id", "Values": [ctx.network().vpc_id]}])["Vpcs"]
+    if not vpcs:
+        raise AssertionError("no shared network VPC available to attach Fargate task ENIs")
+    vpc_id = vpcs[0]["VpcId"]
+    subnets = ec2.describe_subnets(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}, {"Name": "subnet-id", "Values": ctx.network().subnet_ids}])["Subnets"]
+    public = [s["SubnetId"] for s in subnets if s.get("MapPublicIpOnLaunch")]
+    subnet_ids = public or [s["SubnetId"] for s in subnets]
+    if not subnet_ids:
+        raise AssertionError("shared network has no subnets available")
+    sgs = ec2.describe_security_groups(
+        Filters=[{"Name": "vpc-id", "Values": [vpc_id]}, {"Name": "group-name", "Values": ["default"]}]
+    )["SecurityGroups"]
+    return subnet_ids[:1], [sgs[0]["GroupId"]]
+
+
+def _create_execution_role(ctx) -> str:
+    iam = ctx.client("iam")
+    role_name = ctx.unique_name("sim2real-ecsexec-")
+    trust = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Effect": "Allow", "Principal": {"Service": "ecs-tasks.amazonaws.com"}, "Action": "sts:AssumeRole"}
+        ],
+    }
+    role = iam.create_role(RoleName=role_name, AssumeRolePolicyDocument=json.dumps(trust))["Role"]
+    iam.attach_role_policy(RoleName=role_name, PolicyArn=EXEC_POLICY_ARN)
+    ctx.on_cleanup(lambda: iam.delete_role(RoleName=role_name))
+    ctx.on_cleanup(lambda: iam.detach_role_policy(RoleName=role_name, PolicyArn=EXEC_POLICY_ARN))
+    return role["Arn"]
+
+
+def _create_cluster(ctx, insights: bool = False) -> str:
+    ecs = ctx.client("ecs")
+    name = ctx.unique_name("sim2real-cluster-")
+    ecs.create_cluster(
+        clusterName=name,
+        settings=[{"name": "containerInsights", "value": "enabled" if insights else "disabled"}],
+    )
+    ctx.on_cleanup(lambda: ecs.delete_cluster(cluster=name))
+    return name
+
+
+def _register_task_def(
+    ctx,
+    execution_role_arn: str,
+    command: list[str],
+    cpu: str = "256",
+    memory: str = "512",
+    log_group: str | None = None,
+) -> tuple[str, str]:
+    ecs = ctx.client("ecs")
+    family = ctx.unique_name("sim2real-taskdef-")
+    container: dict[str, Any] = {
+        "name": "app",
+        "image": "public.ecr.aws/docker/library/busybox:1.36",
+        "essential": True,
+        "command": command,
+    }
+    if log_group:
+        container["logConfiguration"] = {
+            "logDriver": "awslogs",
+            "options": {
+                "awslogs-group": log_group,
+                "awslogs-region": ctx.region,
+                "awslogs-stream-prefix": "sim2real",
+            },
+        }
+    resp = ecs.register_task_definition(
+        family=family,
+        networkMode="awsvpc",
+        requiresCompatibilities=["FARGATE"],
+        cpu=cpu,
+        memory=memory,
+        executionRoleArn=execution_role_arn,
+        containerDefinitions=[container],
+    )
+    arn = resp["taskDefinition"]["taskDefinitionArn"]
+    ctx.on_cleanup(lambda: _retire_task_definition(ecs, arn))
+    return arn, family
+
+
+def _create_service(
+    ctx,
+    cluster: str,
+    task_def_arn: str,
+    subnets: list[str],
+    sgs: list[str],
+    desired_count: int = 1,
+    service_name: str | None = None,
+) -> str:
+    ecs = ctx.client("ecs")
+    name = service_name or ctx.unique_name("sim2real-svc-")
+    net_cfg = {
+        "awsvpcConfiguration": {"subnets": subnets, "securityGroups": sgs, "assignPublicIp": "ENABLED"}
+    }
+    last_err = None
+    for _ in range(10):
+        try:
+            ecs.create_service(
+                cluster=cluster,
+                serviceName=name,
+                taskDefinition=task_def_arn,
+                desiredCount=desired_count,
+                launchType="FARGATE",
+                networkConfiguration=net_cfg,
+            )
+            break
+        except ClientError as e:
+            last_err = e
+            if e.response["Error"]["Code"] in ("InvalidParameterException", "ClientException"):
+                time.sleep(5)
+                continue
+            raise
+    else:
+        raise last_err
+
+    def _cleanup() -> None:
+        ecs.update_service(cluster=cluster, service=name, desiredCount=0)
+        _poll_until(
+            lambda: len(ecs.list_tasks(cluster=cluster, serviceName=name)["taskArns"]),
+            lambda n: n == 0,
+            timeout_s=180,
+            interval_s=5,
+        )
+        ecs.delete_service(cluster=cluster, service=name, force=True)
+
+    ctx.on_cleanup(_cleanup)
+    return name
+
+
+def _wait_for_running_tasks(ctx, cluster: str, service: str, count: int, timeout_s: float = 300.0) -> None:
+    ecs = ctx.client("ecs")
+    running = _poll_until(
+        lambda: ecs.describe_services(cluster=cluster, services=[service])["services"][0]["runningCount"],
+        lambda n: n == count,
+        timeout_s=timeout_s,
+        interval_s=10,
+    )
+    if running != count:
+        raise AssertionError(f"service never reached exactly {count} running tasks (got {running})")
+
+
+def _poll_until(probe, predicate, timeout_s: float = 120.0, interval_s: float = 5.0):
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while time.monotonic() < deadline:
+        last = probe()
+        if predicate(last):
+            return last
+        time.sleep(interval_s)
+    return last
+
+
+def _retire_task_definition(ecs, task_definition: str) -> None:
+    """Deregister a task definition revision, then delete it: a deregistered revision stays
+    INACTIVE until DeleteTaskDefinitions removes it. An already-deleted revision is fine; any
+    other failure raises."""
+    from botocore.exceptions import ClientError
+
+    try:
+        described = ecs.describe_task_definition(taskDefinition=task_definition)["taskDefinition"]
+    except ClientError as exc:
+        if "Unable to describe task definition" in exc.response["Error"].get("Message", ""):
+            return
+        raise
+    arn = described["taskDefinitionArn"]
+    if described["status"] == "DELETE_IN_PROGRESS":
+        return
+    if described["status"] == "ACTIVE":
+        ecs.deregister_task_definition(taskDefinition=arn)
+    failures = ecs.delete_task_definitions(taskDefinitions=[arn]).get("failures", [])
+    if failures:
+        raise RuntimeError(f"task definition {arn} teardown failed: {failures}")
+
+
+if __name__ == "__main__":
+    from fidelity_tests_runner import main
+    main(run)

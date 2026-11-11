@@ -1,0 +1,465 @@
+"""emr-instance-fleet-provisioned-capacity-matches-real-ec2-instances."""
+from __future__ import annotations
+
+import json
+import time
+
+from behavioral_harness import tags
+from botocore.exceptions import ClientError
+
+CHECK = "emr-instance-fleet-provisioned-capacity-matches-real-ec2-instances"
+GROUP = 'cluster-lifecycle'
+SERVICES = ['emr']
+
+# ===== helpers =====
+#
+# SERVICES stays ['emr'] even though the check reads ec2.describe_instances: that read corroborates
+# an EMR claim; EC2 is not a second subject.
+
+_PRIMARY_TYPE = "m5.xlarge"
+# A second declared type in the core fleet, so "the provisioned type is one of the declared
+# InstanceTypeConfigs" is a real assertion rather than a tautology over a single option. Both carry
+# WeightedCapacity 1, which keeps the provisioned instance COUNT deterministic (a heavier weight
+# would let EMR satisfy the same target with fewer instances).
+_CORE_TYPES = ("m5.xlarge", "m5.2xlarge")
+_PRIMARY_TARGET = 1
+_CORE_TARGET = 2
+_EXPECTED_INSTANCES = _PRIMARY_TARGET + _CORE_TARGET
+
+RELEASE_LABEL = "emr-6.15.0"
+
+_SCENARIO = "emr-instance-fleet"
+_TAGS = [{"Key": "sim2real", "Value": _SCENARIO},
+         {"Key": "sim2real:managed", "Value": "true"},
+         {"Key": "sim2real:prefix", "Value": "sim2real-behav"}]
+
+_EMR_SERVICE_TRUST = json.dumps({
+    "Version": "2012-10-17",
+    "Statement": [{"Effect": "Allow",
+                   "Principal": {"Service": "elasticmapreduce.amazonaws.com"},
+                   "Action": "sts:AssumeRole"}],
+})
+_EC2_TRUST = json.dumps({
+    "Version": "2012-10-17",
+    "Statement": [{"Effect": "Allow", "Principal": {"Service": "ec2.amazonaws.com"},
+                   "Action": "sts:AssumeRole"}],
+})
+_SERVICE_POLICY = "arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceRole"
+_EC2_POLICY = "arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceforEC2Role"
+
+_CLUSTER_GONE_CODES = ("InvalidRequestException", "ClusterNotFound",
+                       "ResourceNotFoundException", "EntityNotFoundException")
+
+
+def _swallow(fn):
+    """Run fn(), ignoring only EMR's refusal of an invalid (already gone) job flow id."""
+    try:
+        fn()
+    except ClientError as exc:
+        err = exc.response["Error"]
+        if not (
+            err["Code"] == "ValidationException"
+            and "Specified job flow ID not valid" in err.get("Message", "")
+        ):
+            raise
+
+
+def _poll(probe, predicate, *, timeout_s=60, interval_s=1.0, description="condition"):
+    """Poll probe() until predicate(result) is truthy; return the final result."""
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while time.monotonic() < deadline:
+        last = probe()
+        if predicate(last):
+            return last
+        time.sleep(interval_s)
+    raise AssertionError(f"{description} not met within {timeout_s}s. Last result: {last!r}")
+
+
+def _delete_with_retry(fn, attempts=8, delay=15):
+    """Run an IAM delete, retrying DeleteConflict."""
+    for i in range(attempts):
+        try:
+            fn()
+            return
+        except Exception as exc:  # noqa: BLE001
+            if "DeleteConflict" not in str(exc) or i == attempts - 1:
+                raise
+            time.sleep(delay)
+
+
+def _ensure_emr_roles(ctx):
+    """Create the EMR service role and the EC2 instance profile. Returns (service_role, ec2_role).
+
+    EMR_DefaultRole and EMR_EC2_DefaultRole do NOT exist in a fresh account, so
+    pointing at them would surface as an untagged ClientError rather than as EMR behaviour.
+    """
+    iam = ctx.client("iam")
+    svc_role = ctx.unique_name("sim2real-behav-emr-fleet-svc-")
+    ec2_role = ctx.unique_name("sim2real-behav-emr-fleet-ec2-")
+
+    iam.create_role(RoleName=svc_role, AssumeRolePolicyDocument=_EMR_SERVICE_TRUST, Tags=_TAGS)
+    ctx.on_cleanup(lambda: _delete_with_retry(lambda: iam.delete_role(RoleName=svc_role)))
+    iam.attach_role_policy(RoleName=svc_role, PolicyArn=_SERVICE_POLICY)
+    ctx.on_cleanup(lambda: iam.detach_role_policy(RoleName=svc_role, PolicyArn=_SERVICE_POLICY))
+
+    iam.create_role(RoleName=ec2_role, AssumeRolePolicyDocument=_EC2_TRUST, Tags=_TAGS)
+    ctx.on_cleanup(lambda: _delete_with_retry(lambda: iam.delete_role(RoleName=ec2_role)))
+    iam.attach_role_policy(RoleName=ec2_role, PolicyArn=_EC2_POLICY)
+    ctx.on_cleanup(lambda: iam.detach_role_policy(RoleName=ec2_role, PolicyArn=_EC2_POLICY))
+
+    iam.create_instance_profile(InstanceProfileName=ec2_role, Tags=_TAGS)
+    ctx.on_cleanup(lambda: _delete_with_retry(
+        lambda: iam.delete_instance_profile(InstanceProfileName=ec2_role)))
+    iam.add_role_to_instance_profile(InstanceProfileName=ec2_role, RoleName=ec2_role)
+    ctx.on_cleanup(lambda: iam.remove_role_from_instance_profile(
+        InstanceProfileName=ec2_role, RoleName=ec2_role))
+
+    # IAM is eventually consistent; EMR rejects a role/profile it cannot see yet. _run_cluster's own
+    # bounded retry on "invalid InstanceProfile" / "invalid ec2" already closes that window, so
+    # there is nothing to wait for here unconditionally.
+    return svc_role, ec2_role
+
+
+def _pick_subnet(ctx):
+    """This check's private subnet (see _private_network), in a zone that offers every declared fleet
+    type: a fleet whose second type is unavailable in the zone narrows EMR's allocation silently."""
+    return _private_network(ctx, (_PRIMARY_TYPE, *_CORE_TYPES))[1]
+
+
+def _cluster_is_gone(exc):
+    """True only for the error that means the cluster no longer exists."""
+    code = (getattr(exc, "response", None) or {}).get("Error", {}).get("Code", "")
+    return code in _CLUSTER_GONE_CODES or "is not valid" in str(exc)
+
+
+def _terminate_and_await_teardown(ctx, emr, cluster_id):
+    """Terminate the cluster and WAIT, so the IAM deletions registered earlier (and therefore
+    running later, LIFO) do not race a cluster still assuming the service role; raises if the
+    cluster is not terminal by the deadline.
+    """
+    _swallow(lambda: emr.terminate_job_flows(JobFlowIds=[cluster_id]))
+    deadline = min(time.monotonic() + 600, _cleanup_deadline(ctx))
+    while time.monotonic() < deadline:
+        try:
+            state = emr.describe_cluster(ClusterId=cluster_id)["Cluster"]["Status"]["State"]
+        except Exception as exc:  # noqa: BLE001
+            if _cluster_is_gone(exc):
+                return
+            time.sleep(2)
+            continue
+        if state in ("TERMINATED", "TERMINATED_WITH_ERRORS"):
+            return
+        time.sleep(2)
+    raise RuntimeError(f"EMR cluster {cluster_id} did not terminate within the teardown wait")
+
+
+def _run_cluster(emr, ctx, service_role, job_flow_role, **params):
+    """RunJobFlow, retrying only the transient IAM-propagation / throttle errors, with teardown
+    registered immediately after the id exists."""
+    left = ctx.time_left()
+    deadline = time.monotonic() + (320 if left is None else min(320, left))
+    while True:
+        try:
+            resp = emr.run_job_flow(ServiceRole=service_role, JobFlowRole=job_flow_role, **params)
+            break
+        except Exception as exc:  # noqa: BLE001
+            low = str(exc).lower()
+            transient = ("throttl" in low or "rate exceeded" in low
+                         or "invalid instanceprofile" in low or "invalid ec2" in low
+                         or "failed to authorize instance profile" in low)
+            if not transient or time.monotonic() >= deadline:
+                raise
+            time.sleep(2)
+    cluster_id = resp["JobFlowId"]
+    ctx.on_cleanup(
+        lambda: _terminate_and_await_teardown(ctx, emr, cluster_id))
+    return cluster_id
+
+
+# ===== end helpers =====
+
+
+@tags("axis:happy-path", "concern:data-plane", "dp:api", "plane:data", "cap:c3", "cap:c5")
+def run(ctx) -> None:
+    """An instance-fleet cluster that reaches WAITING has exactly the capacity it asked for: each
+    fleet's ProvisionedOnDemandCapacity equals its target, and EC2's DescribeInstances confirms
+    every Ec2InstanceId EMR lists is a running instance of a declared type."""
+    emr = ctx.client("emr")
+    ec2 = ctx.client("ec2")
+
+    service_role, job_flow_role = _ensure_emr_roles(ctx)
+    subnet = _pick_subnet(ctx)
+
+    cluster_id = _run_cluster(
+        emr, ctx, service_role, job_flow_role,
+        Name=ctx.unique_name("sim2real-behav-emr-fleet-"),
+        ReleaseLabel=RELEASE_LABEL,
+        Instances={
+            "InstanceFleets": [
+                {"Name": "sim2real-primary", "InstanceFleetType": "MASTER",
+                 "TargetOnDemandCapacity": _PRIMARY_TARGET,
+                 "InstanceTypeConfigs": [
+                     {"InstanceType": _PRIMARY_TYPE, "WeightedCapacity": 1}]},
+                {"Name": "sim2real-core", "InstanceFleetType": "CORE",
+                 "TargetOnDemandCapacity": _CORE_TARGET,
+                 "InstanceTypeConfigs": [
+                     {"InstanceType": t, "WeightedCapacity": 1} for t in _CORE_TYPES]},
+            ],
+            "KeepJobFlowAliveWhenNoSteps": True,
+            "TerminationProtected": False,
+            # Fleets take Ec2SubnetIds (plural); Ec2SubnetId is the instance-group spelling.
+            "Ec2SubnetIds": [subnet],
+        },
+        Applications=[{"Name": "Hadoop"}],
+        VisibleToAllUsers=True,
+        Tags=_TAGS,
+    )
+
+    def _cluster():
+        return emr.describe_cluster(ClusterId=cluster_id)["Cluster"]
+
+    state = _poll(lambda: _cluster()["Status"]["State"],
+                  lambda s: s not in ("STARTING", "BOOTSTRAPPING"),
+                  timeout_s=1500, interval_s=20,
+                  description=f"instance-fleet cluster {cluster_id} finishing provisioning")
+    cluster = _cluster()
+    assert state == "WAITING", (
+        f"the fleet cluster must reach WAITING -- 'provisioned but never came up' is a failure, "
+        f"not a reason to stop looking -- got {state!r} "
+        f"({cluster['Status'].get('StateChangeReason')!r})"
+    )
+    assert cluster.get("InstanceCollectionType") == "INSTANCE_FLEET", (
+        f"a cluster launched with InstanceFleets must report InstanceCollectionType "
+        f"'INSTANCE_FLEET', got {cluster.get('InstanceCollectionType')!r}"
+    )
+
+    fleets = [f for page in emr.get_paginator("list_instance_fleets").paginate(
+        ClusterId=cluster_id) for f in page.get("InstanceFleets", [])]
+    by_type = {f["InstanceFleetType"]: f for f in fleets}
+    assert sorted(by_type) == ["CORE", "MASTER"], (
+        f"exactly the two requested fleets must exist, got {[f.get('Name') for f in fleets]!r}"
+    )
+    for ftype, target in (("MASTER", _PRIMARY_TARGET), ("CORE", _CORE_TARGET)):
+        fleet = by_type[ftype]
+        assert fleet.get("TargetOnDemandCapacity") == target, (
+            f"the {ftype} fleet must report back the target it was given ({target}), got "
+            f"{fleet.get('TargetOnDemandCapacity')!r} in {fleet!r}"
+        )
+        assert fleet.get("ProvisionedOnDemandCapacity") == target, (
+            f"a WAITING fleet must have PROVISIONED exactly its target on-demand capacity, not "
+            f"merely at least it: {ftype} target {target}, provisioned "
+            f"{fleet.get('ProvisionedOnDemandCapacity')!r} (fleet {fleet!r})"
+        )
+        assert fleet.get("ProvisionedSpotCapacity", 0) == 0, (
+            f"no spot capacity was requested, so the {ftype} fleet must report none; got "
+            f"{fleet.get('ProvisionedSpotCapacity')!r}"
+        )
+
+    declared = {"MASTER": {_PRIMARY_TYPE}, "CORE": set(_CORE_TYPES)}
+    fleet_id_to_type = {f["Id"]: f["InstanceFleetType"] for f in fleets}
+
+    # Paginated: a membership assertion on page one is not a membership assertion.
+    instances = [i for page in emr.get_paginator("list_instances").paginate(ClusterId=cluster_id)
+                 for i in page.get("Instances", [])]
+    ids = sorted(i["Ec2InstanceId"] for i in instances)
+    assert len(ids) == _EXPECTED_INSTANCES, (
+        f"both declared core types carry WeightedCapacity 1, so the targets can only be met by "
+        f"exactly {_EXPECTED_INSTANCES} instances; ListInstances reported {len(ids)}: "
+        f"{[(i['Ec2InstanceId'], i['Status']['State']) for i in instances]!r}"
+    )
+    assert len(set(ids)) == len(ids), (
+        f"ListInstances must not repeat an Ec2InstanceId, got {ids!r}"
+    )
+
+    # THE cross-examination: EC2's own inventory, not EMR's report of it.
+    reservations = [r for page in ec2.get_paginator("describe_instances").paginate(InstanceIds=ids)
+                   for r in page.get("Reservations", [])]
+    seen = {i["InstanceId"]: i for r in reservations for i in r.get("Instances", [])}
+    missing = [i for i in ids if i not in seen]
+    assert missing == [], (
+        f"every Ec2InstanceId EMR lists must be an instance EC2 itself knows about; EC2 had no "
+        f"record of {missing!r} (it returned {sorted(seen)!r})"
+    )
+    not_running = {i: seen[i]["State"]["Name"] for i in ids if seen[i]["State"]["Name"] != "running"}
+    assert not_running == {}, (
+        f"every instance behind a WAITING fleet cluster must be running according to EC2; "
+        f"{not_running!r} were not"
+    )
+
+    for inst in instances:
+        iid = inst["Ec2InstanceId"]
+        ftype = fleet_id_to_type[inst["InstanceFleetId"]]
+        actual = seen[iid]["InstanceType"]
+        assert actual in declared[ftype], (
+            f"instance {iid} in the {ftype} fleet is a {actual!r}, which is not one of the "
+            f"declared InstanceTypeConfigs {sorted(declared[ftype])!r}"
+        )
+
+
+# ===== private network =====
+#: The check's own VPC: its clusters sit in a subnet with no internet route, and a gateway
+#: endpoint to S3 (all EMR needs there) is the only way out.
+_PRIVATE_VPC_CIDR = "10.0.0.0/16"
+_PRIVATE_SUBNET_CIDR = "10.0.0.0/24"
+#: The suite's cleanup budget: one deadline per run, started by the first teardown that asks for
+#: it; every teardown wait of the run is cut to it.
+_CLEANUP_BUDGET_S = 900.0
+_cleanup_deadlines: dict[int, tuple[object, float]] = {}
+_CLUSTERS: dict[int, tuple[object, set[str]]] = {}
+_NETWORK_RETRY = frozenset({
+    "DependencyViolation", "InvalidGroup.NotFound", "InvalidPermission.NotFound",
+    "InvalidSubnetID.NotFound", "InvalidNetworkInterfaceID.NotFound",
+})
+_NETWORKS: dict[int, tuple[object, tuple[str, str]]] = {}
+
+
+def _private_network(ctx, instance_types: tuple[str, ...] = ("m5.xlarge",)) -> tuple[str, str]:
+    """(vpc_id, subnet_id) of this check's private network, created on first use in a zone that
+    offers every one of instance_types; its teardown is registered before any cluster is placed in it."""
+    hit = _NETWORKS.get(id(ctx))
+    if hit is not None and hit[0] is ctx:
+        return hit[1]
+    ec2 = ctx.client("ec2")
+    zones = sorted(z["ZoneName"] for z in ec2.describe_availability_zones(
+        Filters=[{"Name": "state", "Values": ["available"]},
+                 {"Name": "zone-type", "Values": ["availability-zone"]}])["AvailabilityZones"])
+    offers = ec2.describe_instance_type_offerings(
+        LocationType="availability-zone",
+        Filters=[{"Name": "instance-type", "Values": sorted(set(instance_types))},
+                 {"Name": "location", "Values": zones}])["InstanceTypeOfferings"]
+    usable = [z for z in zones
+              if set(instance_types) <= {o["InstanceType"] for o in offers if o["Location"] == z}]
+    assert usable, f"no available zone offers all of {sorted(set(instance_types))}: zones {zones!r}"
+    tags = [{"Key": "sim2real:managed", "Value": "true"}]
+    vpc_id = ec2.create_vpc(CidrBlock=_PRIVATE_VPC_CIDR, TagSpecifications=[
+        {"ResourceType": "vpc", "Tags": tags}])["Vpc"]["VpcId"]
+    ctx.on_cleanup(lambda: _drop_private_network(ctx, vpc_id))
+    ctx.client("emr").meta.events.register(
+        "after-call.emr.RunJobFlow", lambda parsed, **_: _track_cluster(ctx, parsed.get("JobFlowId")))
+    ec2.get_waiter("vpc_available").wait(VpcIds=[vpc_id], WaiterConfig={"Delay": 2, "MaxAttempts": 30})
+    ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsHostnames={"Value": True})
+    subnet_id = ec2.create_subnet(
+        VpcId=vpc_id, CidrBlock=_PRIVATE_SUBNET_CIDR, AvailabilityZone=usable[0],
+        TagSpecifications=[{"ResourceType": "subnet", "Tags": tags}])["Subnet"]["SubnetId"]
+    table = ec2.describe_route_tables(Filters=[
+        {"Name": "vpc-id", "Values": [vpc_id]},
+        {"Name": "association.main", "Values": ["true"]}])["RouteTables"][0]["RouteTableId"]
+    ec2.create_vpc_endpoint(
+        VpcId=vpc_id, VpcEndpointType="Gateway", RouteTableIds=[table],
+        ServiceName=f"com.amazonaws.{ec2.meta.region_name}.s3",
+        TagSpecifications=[{"ResourceType": "vpc-endpoint", "Tags": tags}])
+    _NETWORKS[id(ctx)] = (ctx, (vpc_id, subnet_id))
+    return vpc_id, subnet_id
+
+
+def _cleanup_deadline(ctx) -> float:
+    """The run's one teardown deadline, started by the first teardown that asks for it."""
+    hit = _cleanup_deadlines.get(id(ctx))
+    if hit is None or hit[0] is not ctx:
+        hit = _cleanup_deadlines[id(ctx)] = (ctx, time.monotonic() + _CLEANUP_BUDGET_S)
+    return hit[1]
+
+
+def _track_cluster(ctx, cluster_id) -> None:
+    """Record a cluster this check created, so the network teardown waits for it to terminate."""
+    if cluster_id:
+        hit = _CLUSTERS.get(id(ctx))
+        if hit is None or hit[0] is not ctx:
+            hit = _CLUSTERS[id(ctx)] = (ctx, set())
+        hit[1].add(cluster_id)
+
+
+def _drop_private_network(ctx, vpc_id: str) -> None:
+    """Delete the check's VPC: wait for its EMR clusters to terminate, delete its endpoints, wait for
+    its interfaces to release, clear then delete every non-default group (EMR's reference each other),
+    route tables, subnets, the VPC. Retries in-use refusals every 2 s to the run's cleanup deadline."""
+    from botocore.exceptions import ClientError
+
+    _NETWORKS.pop(id(ctx), None)
+    tracked = _CLUSTERS.pop(id(ctx), (ctx, set()))
+    created = tracked[1] if tracked[0] is ctx else set()
+    ec2 = ctx.client("ec2")
+    emr = ctx.client("emr")
+    in_vpc = [{"Name": "vpc-id", "Values": [vpc_id]}]
+    deadline = _cleanup_deadline(ctx)
+
+    def _emr_state(cluster_id: str) -> str:
+        try:
+            return emr.describe_cluster(ClusterId=cluster_id)["Cluster"]["Status"]["State"]
+        except ClientError as exc:
+            err = exc.response["Error"]
+            message = err.get("Message", "").lower()
+            if err["Code"] == "ClusterNotFound" or (
+                    err["Code"] == "InvalidRequestException"
+                    and ("not found" in message or "is not valid" in message)):
+                return "TERMINATED"
+            raise
+
+    def _teardown_pass() -> str:
+        """One pass: what the VPC still waits on, or "" once it is deleted."""
+        clusters = sorted(created | {t["Value"] for r in ec2.describe_instances(Filters=in_vpc)["Reservations"]
+                                     for i in r["Instances"] for t in i.get("Tags", [])
+                                     if t["Key"] == "aws:elasticmapreduce:job-flow-id"})
+        for cluster_id in clusters:
+            state = _emr_state(cluster_id)
+            if state not in ("TERMINATED", "TERMINATED_WITH_ERRORS"):
+                return f"cluster {cluster_id} is {state}"
+        endpoints = [e for e in ec2.describe_vpc_endpoints(Filters=in_vpc)["VpcEndpoints"]
+                     if e["State"].lower() != "deleted"]
+        live = [e["VpcEndpointId"] for e in endpoints if e["State"].lower() != "deleting"]
+        if live:
+            failed = [u for u in ec2.delete_vpc_endpoints(VpcEndpointIds=live).get("Unsuccessful", [])
+                      if u["Error"]["Code"] != "InvalidVpcEndpointId.NotFound"]
+            if failed:
+                raise RuntimeError(f"VPC endpoints of {vpc_id} not deleted: {failed!r}")
+        if endpoints:
+            return f"endpoints {[e['VpcEndpointId'] for e in endpoints]!r} are deleting"
+        interfaces = ec2.describe_network_interfaces(Filters=in_vpc)["NetworkInterfaces"]
+        attached = [n["NetworkInterfaceId"] for n in interfaces if n["Status"] != "available"]
+        if attached:
+            return f"interfaces {attached!r} are still attached"
+        for n in interfaces:
+            ec2.delete_network_interface(NetworkInterfaceId=n["NetworkInterfaceId"])
+        groups = [g for g in ec2.describe_security_groups(Filters=in_vpc)["SecurityGroups"]
+                  if g["GroupName"] != "default"]
+        for g in groups:
+            if g.get("IpPermissions"):
+                ec2.revoke_security_group_ingress(GroupId=g["GroupId"], IpPermissions=g["IpPermissions"])
+            if g.get("IpPermissionsEgress"):
+                ec2.revoke_security_group_egress(
+                    GroupId=g["GroupId"], IpPermissions=g["IpPermissionsEgress"])
+        for g in groups:
+            ec2.delete_security_group(GroupId=g["GroupId"])
+        for table in ec2.describe_route_tables(Filters=in_vpc)["RouteTables"]:
+            associations = table.get("Associations", [])
+            if any(a.get("Main") for a in associations):
+                continue
+            for a in associations:
+                ec2.disassociate_route_table(AssociationId=a["RouteTableAssociationId"])
+            ec2.delete_route_table(RouteTableId=table["RouteTableId"])
+        for s in ec2.describe_subnets(Filters=in_vpc)["Subnets"]:
+            ec2.delete_subnet(SubnetId=s["SubnetId"])
+        ec2.delete_vpc(VpcId=vpc_id)
+        return ""
+
+    while True:
+        try:
+            waiting = _teardown_pass()
+            if not waiting:
+                return
+        except ClientError as exc:
+            code = exc.response["Error"]["Code"]
+            if code == "InvalidVpcID.NotFound":
+                return
+            if code not in _NETWORK_RETRY:
+                raise RuntimeError(f"VPC {vpc_id} teardown: {exc}") from exc
+            waiting = str(exc)
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"VPC {vpc_id} teardown missed the cleanup deadline: {waiting}")
+        time.sleep(2)
+
+
+if __name__ == "__main__":
+    from fidelity_tests_runner import main
+    main(run)

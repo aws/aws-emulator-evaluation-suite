@@ -1,0 +1,9 @@
+{
+  "app": "python3 app.py",
+  "versionReporting": false,
+  "pathMetadata": false,
+  "assetMetadata": false,
+  "context": {
+    "@aws-cdk/aws-apigateway:disableCloudWatchRole": true
+  }
+}

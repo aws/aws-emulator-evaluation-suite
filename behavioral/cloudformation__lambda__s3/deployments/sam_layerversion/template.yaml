@@ -1,0 +1,38 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  FunctionName:
+    Type: String
+  LayerName:
+    Type: String
+  LayerBucket:
+    Type: String
+  LayerKey:
+    Type: String
+Resources:
+  Shared:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Ref LayerName
+      ContentUri:
+        Bucket: !Ref LayerBucket
+        Key: !Ref LayerKey
+      CompatibleRuntimes:
+        - python3.13
+  Fn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Runtime: python3.13
+      Handler: index.handler
+      Layers:
+        - !Ref Shared
+      InlineCode: |
+        import sim2reallayer
+
+
+        def handler(event, context):
+            return {"greeting": sim2reallayer.GREETING, "path": sim2reallayer.__file__}
+Outputs:
+  LayerArn:
+    Value: !Ref Shared

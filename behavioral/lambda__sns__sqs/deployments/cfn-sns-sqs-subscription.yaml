@@ -1,0 +1,46 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SNS topic fanning out to an SQS queue via a subscription filter policy.
+  Used to verify CloudFormation-driven SNS -> SQS integration wiring.
+
+Resources:
+  IntegTopic:
+    Type: AWS::SNS::Topic
+
+  IntegQueue:
+    Type: AWS::SQS::Queue
+
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref IntegQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt IntegQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref IntegTopic
+
+  Subscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref IntegTopic
+      Protocol: sqs
+      Endpoint: !GetAtt IntegQueue.Arn
+      FilterPolicy:
+        category:
+          - orders
+
+Outputs:
+  TopicArn:
+    Value: !Ref IntegTopic
+  QueueUrl:
+    Value: !Ref IntegQueue
+  QueueArn:
+    Value: !GetAtt IntegQueue.Arn

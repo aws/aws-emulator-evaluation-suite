@@ -1,0 +1,28 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  FunctionName:
+    Type: String
+  Reply:
+    Type: String
+Globals:
+  Function:
+    Runtime: python3.13
+    Handler: index.handler
+    MemorySize: 256
+    Timeout: 5
+    Environment:
+      Variables:
+        MODE: global
+Resources:
+  Fn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      AutoPublishAlias: live
+      InlineCode: !Sub |
+        import os
+
+
+        def handler(event, context):
+            return {"reply": "${Reply}", "mode": os.environ["MODE"]}

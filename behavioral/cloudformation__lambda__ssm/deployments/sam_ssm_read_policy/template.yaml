@@ -1,0 +1,30 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  FunctionName:
+    Type: String
+  AllowedParameter:
+    Type: String
+Resources:
+  Fn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 10
+      Policies:
+        - SSMParameterReadPolicy:
+            ParameterName: !Ref AllowedParameter
+      InlineCode: |
+        import boto3
+        from botocore.exceptions import ClientError
+
+
+        def handler(event, context):
+            try:
+                value = boto3.client("ssm").get_parameter(Name=event["name"])["Parameter"]["Value"]
+            except ClientError as exc:
+                return {"code": exc.response["Error"]["Code"],
+                        "message": exc.response["Error"]["Message"]}
+            return {"value": value}

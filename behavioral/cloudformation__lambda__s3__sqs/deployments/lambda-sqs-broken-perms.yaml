@@ -1,0 +1,64 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda + SQS stack with intentionally broken IAM (no sqs:SendMessage)
+
+Resources:
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'sim2real-xsvc-broken-queue-${AWS::StackName}'
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'sim2real-xsvc-broken-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BasicExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'sim2real-xsvc-broken-fn-${AWS::StackName}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref Queue
+      Code:
+        ZipFile: |
+          import json, os, boto3
+          from botocore.exceptions import ClientError
+          def lambda_handler(event, context):
+              sqs = boto3.client('sqs')
+              try:
+                  sqs.send_message(
+                      QueueUrl=os.environ['QUEUE_URL'],
+                      MessageBody=json.dumps(event)
+                  )
+                  return {'statusCode': 200, 'body': 'sent'}
+              except ClientError as e:
+                  code = e.response['Error']['Code']
+                  return {'statusCode': 403, 'error': code, 'message': str(e)}
+
+Outputs:
+  FunctionName:
+    Value: !Ref LambdaFunction
+  QueueUrl:
+    Value: !Ref Queue

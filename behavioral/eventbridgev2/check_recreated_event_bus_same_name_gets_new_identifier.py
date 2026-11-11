@@ -1,0 +1,159 @@
+"""recreated-event-bus-same-name-gets-new-identifier."""
+from __future__ import annotations
+
+import time
+
+from botocore.exceptions import ClientError
+
+from behavioral_harness import tags
+
+CHECK = "recreated-event-bus-same-name-gets-new-identifier"
+GROUP = "event-bus-identity"
+SERVICES = ["eventbridgev2"]
+
+_SETTLE_TIMEOUT_S = 60.0
+_DELETE_TIMEOUT_S = 120.0
+
+
+def _budget_s(ctx, cap_s):
+    """A poll's timeout: cap_s, bounded by the runner's remaining time less 5 s so the poll fails
+    with its own message."""
+    left = ctx.time_left()
+    return cap_s if left is None else max(1.0, min(cap_s, left - 5.0))
+
+
+def _budget_spent(ctx):
+    """True when the runner's remaining time, not the wait's own deadline, ended a capped wait."""
+    left = ctx.time_left()
+    return left is not None and left <= 6.0
+
+
+def _teardown(undo, *not_found: str):
+    """A cleanup running ``undo()`` where a failed delete raises; only ``not_found`` means gone."""
+
+    def run_undo() -> None:
+        try:
+            undo()
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] in not_found:
+                return
+            raise
+
+    return run_undo
+
+
+def _refused(fn, on_success=None):
+    """(Error.Code, Error.Message) of the ClientError ``fn`` raises.
+
+    An unexpected success hands its result to ``on_success`` (to register its cleanup) and fails.
+    """
+    try:
+        result = fn()
+    except ClientError as exc:
+        err = exc.response.get("Error", {})
+        return err.get("Code"), err.get("Message")
+    if on_success is not None:
+        on_success(result)
+    raise AssertionError(f"expected the call to be refused, but it succeeded: {result!r}")
+
+
+def _bus_teardown(ebv2, bus_arn: str):
+    """Delete the bus, waiting out a transient state or a child whose delete is still settling."""
+
+    def run_undo() -> None:
+        deadline = time.monotonic() + _SETTLE_TIMEOUT_S
+        while True:
+            try:
+                ebv2.delete_event_bus(EventBusArn=bus_arn)
+                return
+            except ClientError as exc:
+                code = exc.response["Error"]["Code"]
+                if code == "ResourceNotFoundException":
+                    return
+                if code not in ("InvalidStateException", "ResourceInUseException"):
+                    raise
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(2)
+
+    return run_undo
+
+
+def _wait_bus_state(ctx, ebv2, bus_arn: str, state: str) -> dict:
+    """DescribeEventBus once the bus reports ``state``."""
+    deadline = time.monotonic() + _budget_s(ctx, _SETTLE_TIMEOUT_S)
+    while True:
+        described = ebv2.describe_event_bus(EventBusArn=bus_arn)
+        if described["State"] == state:
+            return described
+        if time.monotonic() > deadline:
+            if _budget_spent(ctx):
+                raise TimeoutError("the run budget ended before the bus settled; not graded")
+            raise AssertionError(f"bus stayed {described['State']!r}, never reached {state}")
+        time.sleep(2)
+
+
+def _create_bus(ctx, ebv2, **kwargs) -> dict:
+    """An ACTIVE bus of the check's own, deleted at cleanup."""
+    bus = ebv2.create_event_bus(
+        Name=kwargs.pop("Name", None) or ctx.unique_name("sim2real-behav-ebv2-bus-"),
+        ClientToken=ctx.unique_name("sim2real-behav-tok-"),
+        **kwargs,
+    )
+    ctx.on_cleanup(_bus_teardown(ebv2, bus["EventBusArn"]))
+    _wait_bus_state(ctx, ebv2, bus["EventBusArn"], "ACTIVE")
+    return bus
+
+
+@tags("axis:happy-path", "cap:c1", "concern:representation", "plane:control")
+def run(ctx) -> None:
+    """A bus deleted and created again under the same name gets an ARN with a new generated
+    identifier; the old ARN stays not found while the new one describes as ACTIVE.
+    
+    Reference: https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-custom-bus-what-is.html
+    """
+    ebv2 = ctx.client("eventbridgev2")
+    first = _create_bus(ctx, ebv2)
+    name, first_arn = first["Name"], first["EventBusArn"]
+    assert first_arn.startswith(f"arn:aws:events:{ctx.region}:{ctx.account}:event-busv2/{name}/"), (
+        f"bus ARN {first_arn!r} does not name the bus"
+    )
+    suffix = first_arn.rsplit("/", 1)[1]
+    assert len(suffix) == 25 and suffix.isalnum() and suffix == suffix.lower(), (
+        f"bus ARN ends in {suffix!r}, expected a 25-character lowercase generated identifier"
+    )
+
+    ebv2.delete_event_bus(EventBusArn=first_arn)
+    deadline = time.monotonic() + _budget_s(ctx, _DELETE_TIMEOUT_S)
+    while True:
+        try:
+            state = ebv2.describe_event_bus(EventBusArn=first_arn)["State"]
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "ResourceNotFoundException":
+                raise
+            break
+        if time.monotonic() > deadline:
+            if _budget_spent(ctx):
+                raise TimeoutError("the run budget ended before the bus was deleted; not graded")
+            raise AssertionError(f"bus stayed {state!r} after DeleteEventBus")
+        time.sleep(2)
+
+    second = _create_bus(ctx, ebv2, Name=name)
+    second_arn = second["EventBusArn"]
+    assert second["Name"] == name, f"the recreated bus is named {second['Name']!r}"
+    assert second_arn != first_arn, "the recreated bus reused the deleted bus's ARN"
+    assert second_arn.rsplit("/", 1)[0] == first_arn.rsplit("/", 1)[0], (
+        f"the ARNs differ beyond the identifier: {first_arn!r} vs {second_arn!r}"
+    )
+    got = _refused(lambda: ebv2.describe_event_bus(EventBusArn=first_arn))
+    assert got == ("ResourceNotFoundException", f"Event bus not found: {name}"), (
+        f"the deleted bus's ARN describes as {got!r}"
+    )
+    listed = [b["EventBusArn"] for page in ebv2.get_paginator("list_event_buses").paginate(NamePrefix=name)
+              for b in page["EventBuses"] if b["Name"] == name]
+    assert listed == [second_arn], f"ListEventBuses shows {listed!r}, expected only the new bus"
+
+
+if __name__ == "__main__":
+    from fidelity_tests_runner import main
+    main(run)

@@ -1,0 +1,98 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Zero-capacity Auto Scaling group in a two-subnet VPC. AvailabilityZones is
+  declared nowhere: Auto Scaling must derive it from VPCZoneIdentifier by
+  resolving each subnet id through EC2. DesiredCapacity/MinSize are 0 so the
+  stack launches no instance and costs nothing.
+
+Parameters:
+  ImageId:
+    Type: String
+    Description: AMI the launch template must resolve to (passed in by the check).
+  LaunchTemplateName:
+    Type: String
+    Description: Name for the launch template the group is pinned to.
+  AsgName:
+    Type: String
+    Description: Name for the Auto Scaling group.
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.171.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'sim2real-xsvc-asg-vpc-${AWS::StackName}'
+
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.171.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub 'sim2real-xsvc-asg-subnet-a-${AWS::StackName}'
+
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.171.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub 'sim2real-xsvc-asg-subnet-b-${AWS::StackName}'
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Ref LaunchTemplateName
+      LaunchTemplateData:
+        ImageId: !Ref ImageId
+        InstanceType: t3.micro
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: sim2real:managed
+                Value: 'true'
+              - Key: sim2real:prefix
+                Value: sim2real-xsvc
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Ref AsgName
+      MinSize: '0'
+      MaxSize: '1'
+      DesiredCapacity: '0'
+      VPCZoneIdentifier:
+        - !Ref SubnetA
+        - !Ref SubnetB
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: sim2real:managed
+          Value: 'true'
+          PropagateAtLaunch: true
+        - Key: sim2real:prefix
+          Value: sim2real-xsvc
+          PropagateAtLaunch: true
+
+Outputs:
+  AsgNameOut:
+    Value: !Ref AutoScalingGroup
+  VpcId:
+    Value: !Ref Vpc
+  SubnetAId:
+    Value: !Ref SubnetA
+  SubnetBId:
+    Value: !Ref SubnetB
+  LaunchTemplateId:
+    Value: !Ref LaunchTemplate
+  LaunchTemplateLatestVersion:
+    Value: !GetAtt LaunchTemplate.LatestVersionNumber

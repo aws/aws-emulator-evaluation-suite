@@ -1,0 +1,27 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "sim2real-xsvc deploy-rollback: an SNS topic, then (DependsOn) an OpenSearch_2.3 domain on or1.medium.search, an instance type only later 2.x engines support. CreateDomain rejects it after the topic exists, so the stack must roll the topic back.",
+  "Parameters": {
+    "TopicName": {"Type": "String"},
+    "DomainName": {"Type": "String"}
+  },
+  "Resources": {
+    "Topic": {
+      "Type": "AWS::SNS::Topic",
+      "Properties": {"TopicName": {"Ref": "TopicName"}}
+    },
+    "Domain": {
+      "Type": "AWS::OpenSearchService::Domain",
+      "DependsOn": "Topic",
+      "Properties": {
+        "DomainName": {"Ref": "DomainName"},
+        "EngineVersion": "OpenSearch_2.3",
+        "ClusterConfig": {"InstanceType": "or1.medium.search", "InstanceCount": 1},
+        "EBSOptions": {"EBSEnabled": true, "VolumeType": "gp3", "VolumeSize": 20}
+      }
+    }
+  },
+  "Outputs": {
+    "TopicArn": {"Value": {"Ref": "Topic"}}
+  }
+}

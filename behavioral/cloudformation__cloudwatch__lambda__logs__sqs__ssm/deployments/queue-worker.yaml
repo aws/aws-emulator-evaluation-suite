@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  SQS-triggered Lambda worker whose update surface is deliberately split so one change set has to
+  classify a REPLACEMENT and an in-place MODIFY in the same request, and leave two resources out of
+  the change set entirely.
+
+# WHY THE PARAMETERS ARE SHAPED THIS WAY
+#   WorkerConfigParamName  -> AWS::SSM::Parameter Name is CREATE-ONLY, so changing it must be
+#                             classified Replacement=True / RequiresRecreation=Always, and executing
+#                             must destroy the old parameter and create a new physical one.
+#   LogLevel               -> a Lambda environment variable is updatable in place, so changing it
+#                             must be Replacement=False / RequiresRecreation=Never and must NOT
+#                             change the function's physical id.
+#   QueueName / AlarmName  -> held constant across the update on purpose. They are the barrier: a
+#                             target that reports "everything changed" is caught by their ABSENCE
+#                             from the change set and by their physical ids surviving it.
+
+Parameters:
+  QueueName:
+    Type: String
+  FunctionName:
+    Type: String
+  WorkerConfigParamName:
+    Type: String
+    Description: Create-only Name of the SSM parameter; changing it forces a replacement.
+  WorkerConfigValue:
+    Type: String
+  LogLevel:
+    Type: String
+    Default: INFO
+  MetricNamespace:
+    Type: String
+  MetricName:
+    Type: String
+  AlarmName:
+    Type: String
+  AlarmThreshold:
+    Type: Number
+    Default: 1
+
+Resources:
+  WorkerConfig:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Ref WorkerConfigParamName
+      Type: String
+      Value: !Ref WorkerConfigValue
+
+  WorkQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref QueueName
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 3600
+
+  # Declared rather than left to Lambda's implicit creation, so DELETE_COMPLETE really removes it
+  # and the teardown leg can assert the log group is gone.
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${FunctionName}'
+      RetentionInDays: 7
+
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: worker
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt WorkQueue.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${FunctionName}:*'
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${WorkerConfigParamName}'
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+
+  WorkerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - WorkerLogGroup
+    Properties:
+      FunctionName: !Ref FunctionName
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt WorkerRole.Arn
+      Environment:
+        Variables:
+          CONFIG_PARAM: !Ref WorkerConfigParamName
+          LOG_LEVEL: !Ref LogLevel
+          METRIC_NAMESPACE: !Ref MetricNamespace
+          METRIC_NAME: !Ref MetricName
+          WORKER_ID: !Ref FunctionName
+      Code:
+        ZipFile: |
+          import json
+          import os
+
+          import boto3
+
+          cw = boto3.client('cloudwatch')
+          ssm = boto3.client('ssm')
+
+
+          def handler(event, context):
+              cfg = ssm.get_parameter(Name=os.environ['CONFIG_PARAM'])['Parameter']['Value']
+              n = 0
+              for rec in event.get('Records', []):
+                  print(json.dumps({
+                      'event': 'work.processed',
+                      'level': os.environ['LOG_LEVEL'],
+                      'messageId': rec['messageId'],
+                      'body': rec['body'],
+                      'config': cfg,
+                      'requestId': context.aws_request_id,
+                  }))
+                  n += 1
+              cw.put_metric_data(
+                  Namespace=os.environ['METRIC_NAMESPACE'],
+                  MetricData=[{
+                      'MetricName': os.environ['METRIC_NAME'],
+                      'Dimensions': [{'Name': 'Worker', 'Value': os.environ['WORKER_ID']}],
+                      'Value': n,
+                      'Unit': 'Count',
+                  }],
+              )
+              return {'processed': n}
+
+  WorkerEsm:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt WorkQueue.Arn
+      FunctionName: !Ref WorkerFunction
+      BatchSize: 1
+      Enabled: true
+
+  # ActionsEnabled is false on purpose: this alarm's subject is EVALUATION off a real custom metric
+  # datapoint, not notification delivery. TreatMissingData=notBreaching keeps the pre-datapoint state
+  # INSUFFICIENT_DATA rather than making the first missing period breach.
+  ProcessedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Ref AlarmName
+      Namespace: !Ref MetricNamespace
+      MetricName: !Ref MetricName
+      Dimensions:
+        - Name: Worker
+          Value: !Ref FunctionName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: !Ref AlarmThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      ActionsEnabled: false
+
+Outputs:
+  QueueUrl:
+    Value: !Ref WorkQueue
+  QueueArn:
+    Value: !GetAtt WorkQueue.Arn
+  WorkerFunctionName:
+    Value: !Ref WorkerFunction
+  ConfigParamName:
+    Value: !Ref WorkerConfig
+  LogGroupName:
+    Value: !Ref WorkerLogGroup
+  AlarmNameOut:
+    Value: !Ref ProcessedAlarm

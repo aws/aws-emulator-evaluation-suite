@@ -1,0 +1,65 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  A single-node, PUBLICLY ACCESSIBLE OpenSearch domain, deployed on its own so the indexing pipeline
+  and its failure-injection variant can both be pointed at one domain instead of provisioning two.
+
+# WHY THERE IS NO VpcOptions HERE.
+# docs/STATUS.md section 1 records the T3 problem: an in-VPC data plane is unreachable from the
+# runner, and a Lambda whose VpcConfig an emulator ignored would still run and simply fail to connect
+# - indistinguishable from "the data plane is broken". A domain with no VpcOptions has a public
+# endpoint, so the check can assert the OpenSearch data plane DIRECTLY (a signed HTTPS query from the
+# runner) as well as through the indexer, which is what makes "the document is queryable" provable
+# rather than inferred.
+#
+# WHY AccessPolicies NAMES THE ACCOUNT ROOT.
+# Naming the indexer role instead would put the role and the domain in a dependency cycle (the role
+# needs the domain ARN, the domain needs the role ARN) and would also mean the failure-injection
+# variant could not reuse this domain. Delegating to the account root moves the whole authorization
+# decision into the IAM identity policy each pipeline stack writes for itself - which is exactly the
+# thing the negative leg removes one action from.
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: 3-28 chars, lowercase; the check truncates its unique name to fit.
+  EngineVersion:
+    Type: String
+    Default: OpenSearch_2.11
+
+Resources:
+  SearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: !Ref DomainName
+      EngineVersion: !Ref EngineVersion
+      ClusterConfig:
+        InstanceType: t3.small.search
+        InstanceCount: 1
+        DedicatedMasterEnabled: false
+        ZoneAwarenessEnabled: false
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp2
+        VolumeSize: 10
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      EncryptionAtRestOptions:
+        Enabled: true
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'es:ESHttp*'
+            Resource: !Sub 'arn:${AWS::Partition}:es:${AWS::Region}:${AWS::AccountId}:domain/${DomainName}/*'
+
+Outputs:
+  DomainEndpoint:
+    Value: !GetAtt SearchDomain.DomainEndpoint
+  DomainArn:
+    Value: !GetAtt SearchDomain.Arn
+  DomainNameOut:
+    Value: !Ref SearchDomain

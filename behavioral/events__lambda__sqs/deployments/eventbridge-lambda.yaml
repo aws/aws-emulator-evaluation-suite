@@ -1,0 +1,89 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EventBridge rule invoking a Lambda function target, which forwards the
+  received event to an SQS queue created in the same stack for verification.
+
+Resources:
+  ResultQueue:
+    Type: AWS::SQS::Queue
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SendToResultQueue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt ResultQueue.Arn
+        - PolicyName: BasicLogging
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  ForwarderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.12
+      Role: !GetAtt ExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          RESULT_QUEUE_URL: !Ref ResultQueue
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+
+
+          def handler(event, context):
+              sqs = boto3.client("sqs")
+              sqs.send_message(
+                  QueueUrl=os.environ["RESULT_QUEUE_URL"],
+                  MessageBody=json.dumps(event),
+              )
+              return {"ok": True}
+
+  EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - custom.cfntest
+      State: ENABLED
+      Targets:
+        - Id: forwarder
+          Arn: !GetAtt ForwarderFunction.Arn
+
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ForwarderFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventRule.Arn
+
+Outputs:
+  ResultQueueUrl:
+    Value: !Ref ResultQueue
+  FunctionArn:
+    Value: !GetAtt ForwarderFunction.Arn
+  RuleArn:
+    Value: !GetAtt EventRule.Arn

@@ -1,0 +1,70 @@
+"""tag-resource-not-found-with-positive-control."""
+from __future__ import annotations
+
+from behavioral_harness import tags
+from botocore.exceptions import ClientError
+
+CHECK = "tag-resource-not-found-with-positive-control"
+GROUP = "error-semantics"
+SERVICES = ["backupsearch"]
+
+
+@tags("axis:rejection", "cap:c1", "concern:negative-classes", "concern:representation", "plane:control")
+def run(ctx) -> None:
+    """TagResource on a well-formed but nonexistent search-job ARN is rejected with
+    NotFoundException and writes no tags, while tagging a real search job succeeds and shows in
+    ListTagsForResource."""
+    bs = ctx.client("backupsearch")
+    started = bs.start_search_job(
+        Name=ctx.unique_name("sim2real-behav-searchjob-"),
+        SearchScope={"BackupResourceTypes": ["S3"]},
+    )
+    job_id = started["SearchJobIdentifier"]
+    real_arn = started["SearchJobArn"]
+    ctx.on_cleanup(lambda: _best_effort_stop(bs, job_id))
+
+    bogus_arn = real_arn.rsplit("/", 1)[0] + "/00000000-0000-0000-0000-000000000000"
+
+    code, message = _client_error(lambda: bs.tag_resource(ResourceArn=bogus_arn, Tags={"k": "v"}))
+    assert code == "NotFoundException", f"expected NotFoundException, got code={code!r}"
+    assert message == "Resource was not found", f"unexpected message {message!r}"
+
+    # The rejected call must have written the tag nowhere -- in particular not onto the
+    # real resource whose ARN the bogus one was derived from.
+    pre_control = bs.list_tags_for_resource(ResourceArn=real_arn)
+    assert pre_control.get("Tags", {}) == {}, f"expected no tags written by the rejected call, got {pre_control!r}"
+
+    # Positive control: tagging the real resource with the same operation succeeds.
+    bs.tag_resource(ResourceArn=real_arn, Tags={"sim2real-ctrl": "ok"})
+    control = bs.list_tags_for_resource(ResourceArn=real_arn)
+    assert control["Tags"] == {"sim2real-ctrl": "ok"}, f"expected {{'sim2real-ctrl': 'ok'}}, got {control!r}"
+
+
+def _client_error(fn):
+    """Return the (code, message) of the ClientError ``fn`` raises; a success fails the check."""
+    from botocore.exceptions import ClientError
+
+    try:
+        result = fn()
+    except ClientError as err:
+        return err.response["Error"]["Code"], err.response["Error"].get("Message")
+    raise AssertionError(f"expected a ClientError, but the call succeeded and returned {result!r}")
+
+
+def _best_effort_stop(bs, job_id: str) -> None:
+    # A job already in a terminal state answers StopSearchJob with ConflictException: nothing to stop.
+    try:
+        bs.stop_search_job(SearchJobIdentifier=job_id)
+    except ClientError as exc:
+        code = exc.response["Error"]["Code"]
+        if code == "ResourceNotFoundException":
+            return
+        terminal = ("COMPLETED", "FAILED", "STOPPED", "STOPPING")
+        if code == "ConflictException" and bs.get_search_job(SearchJobIdentifier=job_id)["Status"] in terminal:
+            return
+        raise
+
+
+if __name__ == "__main__":
+    from fidelity_tests_runner import main
+    main(run)

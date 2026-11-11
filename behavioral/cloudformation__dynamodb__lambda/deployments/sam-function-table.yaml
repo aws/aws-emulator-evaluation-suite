@@ -1,0 +1,71 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: SAM transform end-to-end - SimpleTable + Function only, no concrete types
+
+# Every resource below is an AWS::Serverless::* type and NO execution role is declared, so the
+# transform has to invent the AWS::DynamoDB::Table, the AWS::Lambda::Function and the
+# AWS::IAM::Role carrying DynamoDBCrudPolicy. If it does not, the invoked function cannot write
+# to the table and the check's read-back through DynamoDB's own API fails. ProvisionedThroughput
+# is deliberately omitted so SimpleTable defaults to on-demand billing: nothing here provisions
+# capacity it would then have to pay for.
+
+Parameters:
+  TableName:
+    Type: String
+    Description: Name for the SimpleTable; Ref of the table must return exactly this.
+  FunctionName:
+    Type: String
+    Description: Name for the serverless function.
+
+Resources:
+  Items:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      TableName: !Ref TableName
+      PrimaryKey:
+        Name: pk
+        Type: String
+
+  Writer:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableName
+      InlineCode: |
+        import os
+
+        import boto3
+
+        ddb = boto3.client('dynamodb')
+
+
+        def handler(event, context):
+            table = os.environ['TABLE_NAME']
+            ddb.put_item(
+                TableName=table,
+                Item={
+                    'pk': {'S': event['pk']},
+                    'note': {'S': event['note']},
+                },
+            )
+            return {'table': table, 'note': event['note']}
+
+Outputs:
+  TableNameOut:
+    Description: Ref of a SimpleTable, which must be the table's name.
+    Value: !Ref Items
+  WriterFunctionName:
+    Description: Ref of a Serverless::Function, which must be the function's name.
+    Value: !Ref Writer
+  WriterArn:
+    Description: GetAtt Arn of a Serverless::Function, which must be the real function ARN.
+    Value: !GetAtt Writer.Arn

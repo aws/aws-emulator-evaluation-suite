@@ -1,0 +1,80 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: SQS + Lambda + ESM stack
+
+Resources:
+  SourceQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'sim2real-xsvc-src-${AWS::StackName}'
+
+  ResultQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'sim2real-xsvc-res-${AWS::StackName}'
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'sim2real-xsvc-esm-lrole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt SourceQueue.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt ResultQueue.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  LambdaFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'sim2real-xsvc-esm-fn-${AWS::StackName}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          RESULT_QUEUE_URL: !Ref ResultQueue
+      Code:
+        ZipFile: |
+          import boto3, os, json
+          def lambda_handler(event, context):
+              sqs = boto3.client('sqs')
+              for record in event.get('Records', []):
+                  sqs.send_message(QueueUrl=os.environ['RESULT_QUEUE_URL'], MessageBody=record['body'])
+              return {'ok': True}
+
+  ESM:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt SourceQueue.Arn
+      FunctionName: !Ref LambdaFn
+      BatchSize: 1
+      Enabled: true
+
+Outputs:
+  SourceQueueUrl:
+    Value: !Ref SourceQueue
+  ResultQueueUrl:
+    Value: !Ref ResultQueue

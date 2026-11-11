@@ -1,0 +1,86 @@
+"""update-vocabulary-resets-state-and-content."""
+from __future__ import annotations
+
+import time
+import urllib.request
+
+from botocore.exceptions import ClientError
+
+from behavioral_harness import tags
+
+
+def _routed_request(ctx, url, data=None, headers=None, **kwargs):
+    """A urllib Request that reaches ``url`` on the target, with ``ctx.endpoint_route``'s headers."""
+    target, route = ctx.endpoint_route(url)
+    return urllib.request.Request(target, data=data, headers={**(headers or {}), **route}, **kwargs)
+
+
+CHECK = "update-vocabulary-resets-state-and-content"
+GROUP = "state"
+SERVICES = ["transcribe"]
+
+
+@tags("axis:happy-path", "cap:c1", "cap:c4", "concern:data-plane", "concern:representation", "dp:endpoint", "plane:data")
+def run(ctx) -> None:
+    """UpdateVocabulary synchronously reports PENDING in its own response (reprocessing),
+    then converges back to READY with the NEW phrase content replacing the old one."""
+    tx = ctx.client("transcribe")
+    name = ctx.unique_name("sim2real-behav-vocab-update-")
+    tx.create_vocabulary(
+        VocabularyName=name,
+        LanguageCode="en-US",
+        Phrases=["Mercury", "Venus"],
+        Tags=[{"Key": "sim2real-env", "Value": "behavioral"}],
+    )
+    ctx.on_cleanup(lambda: _delete_vocabulary_ignore_missing(ctx, name))
+
+    _poll_vocabulary_state(ctx, name, timeout_s=300, interval_s=10)
+    initial_uri = tx.get_vocabulary(VocabularyName=name)["DownloadUri"]
+    initial_content = _download(ctx, initial_uri).upper()
+    assert "MERCURY" in initial_content, f"expected seed phrase MERCURY in initial download, got: {initial_content!r}"
+
+    update_resp = tx.update_vocabulary(VocabularyName=name, LanguageCode="en-US", Phrases=["Mars", "Jupiter"])
+    # UpdateVocabulary's own response is the synchronous contract: reprocessing always
+    # starts from PENDING again, it never flips straight back to READY in the same call.
+    assert update_resp["VocabularyState"] == "PENDING", (
+        f"expected UpdateVocabulary's own response to report PENDING, got {update_resp['VocabularyState']!r}"
+    )
+
+    final_state = _poll_vocabulary_state(ctx, name, timeout_s=300, interval_s=10)
+    assert final_state == "READY", f"expected READY after update, got {final_state}"
+
+    updated_uri = tx.get_vocabulary(VocabularyName=name)["DownloadUri"]
+    updated_content = _download(ctx, updated_uri).upper()
+    assert "MARS" in updated_content, f"expected updated phrase MARS in download after update, got: {updated_content!r}"
+    assert "MERCURY" not in updated_content, "stale phrase list persisted after update"
+
+
+def _poll_vocabulary_state(ctx, name: str, timeout_s: float = 300.0, interval_s: float = 10.0) -> str:
+    tx = ctx.client("transcribe")
+    deadline = time.monotonic() + timeout_s
+    state = None
+    while time.monotonic() < deadline:
+        state = tx.get_vocabulary(VocabularyName=name)["VocabularyState"]
+        if state != "PENDING":
+            return state
+        time.sleep(interval_s)
+    raise AssertionError(f"vocabulary {name} stayed PENDING for {timeout_s}s (last state={state})")
+
+
+def _download(ctx, url: str) -> str:
+    with urllib.request.urlopen(_routed_request(ctx, url), timeout=30) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def _delete_vocabulary_ignore_missing(ctx, name: str) -> None:
+    tx = ctx.client("transcribe")
+    try:
+        tx.delete_vocabulary(VocabularyName=name)
+    except ClientError as e:
+        if e.response["Error"]["Code"] not in ("NotFoundException", "BadRequestException"):
+            raise
+
+
+if __name__ == "__main__":
+    from fidelity_tests_runner import main
+    main(run)

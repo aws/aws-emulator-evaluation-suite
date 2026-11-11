@@ -1,0 +1,159 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  An HTTP API whose route set is controlled by a stack PARAMETER, behind a $default
+  stage with AutoDeploy: true. Deployed once with IncludeSecondRoute=false (route
+  "GET /v1" only) and then UPDATED with IncludeSecondRoute=true, which adds
+  "GET /v2". Nothing else about the stack changes, so a difference observed at the
+  HTTPS endpoint after the update is attributable to the route addition alone.
+
+  The check that owns this template also creates a SECOND stage out of band, with
+  AutoDeploy: false and an explicit deployment id, so that CloudFormation cannot
+  touch it: that stage is the twin control which must keep serving the pre-update
+  route set until an explicit CreateDeployment.
+
+  The integration Lambda is inline and echoes the route key it was reached
+  through, so the response body names WHICH deployment snapshot served it.
+
+Parameters:
+  ApiName:
+    Type: String
+    Description: Name for the HTTP API (unique per run, supplied by the check).
+  FunctionName:
+    Type: String
+    Description: Name for the echo Lambda (unique per run, supplied by the check).
+  RoleName:
+    Type: String
+    Description: Name for the Lambda execution role (unique per run, supplied by the check).
+  IncludeSecondRoute:
+    Type: String
+    Description: >-
+      "false" on create (GET /v1 only), "true" on update (adds GET /v2). This is the
+      single lever the check moves.
+    AllowedValues:
+      - 'false'
+      - 'true'
+    Default: 'false'
+
+Conditions:
+  WithSecondRoute: !Equals [!Ref IncludeSecondRoute, 'true']
+
+Resources:
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Path: /sim2real/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: inline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:*:*:*'
+      Tags:
+        - Key: sim2real:managed
+          Value: 'true'
+        - Key: sim2real:prefix
+          Value: sim2real-xsvc
+
+  EchoFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt ExecutionRole.Arn
+      Timeout: 20
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import json
+
+
+          def lambda_handler(event, context):
+              rc = event.get("requestContext") or {}
+              return {
+                  "statusCode": 200,
+                  "headers": {"Content-Type": "application/json"},
+                  "body": json.dumps(
+                      {"routeKey": rc.get("routeKey"), "rawPath": event.get("rawPath")}
+                  ),
+              }
+      Tags:
+        - Key: sim2real:managed
+          Value: 'true'
+        - Key: sim2real:prefix
+          Value: sim2real-xsvc
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Ref ApiName
+      ProtocolType: HTTP
+      Tags:
+        sim2real:managed: 'true'
+        sim2real:prefix: sim2real-xsvc
+
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt EchoFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*'
+
+  EchoIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt EchoFunction.Arn
+      IntegrationMethod: POST
+      PayloadFormatVersion: '2.0'
+
+  RouteV1:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /v1
+      Target: !Join ['/', ['integrations', !Ref EchoIntegration]]
+
+  RouteV2:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: WithSecondRoute
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /v2
+      Target: !Join ['/', ['integrations', !Ref EchoIntegration]]
+
+  AutoDeployStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+      Tags:
+        sim2real:managed: 'true'
+        sim2real:prefix: sim2real-xsvc
+
+Outputs:
+  ApiIdOut:
+    Description: The HTTP API's id, which the check needs to build the invoke URL.
+    Value: !Ref HttpApi
+  FunctionNameOut:
+    Description: The echo Lambda's name, so the check can assert on its log group.
+    Value: !Ref EchoFunction
+  RouteSetOut:
+    Description: Which route set this stack revision declares.
+    Value: !If [WithSecondRoute, 'v1+v2', 'v1']

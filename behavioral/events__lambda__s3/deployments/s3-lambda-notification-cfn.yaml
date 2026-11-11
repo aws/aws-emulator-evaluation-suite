@@ -1,0 +1,93 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  S3 bucket that triggers a Lambda function on ObjectCreated events under
+  prefix "incoming/" and copies the object to "processed/<key>". Exercises
+  correct deployment ordering between the Lambda resource-based permission
+  and the S3 bucket NotificationConfiguration (S3 validates that the
+  permission exists at bucket-configuration time).
+
+Resources:
+  ProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: s3-copy-and-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: Allow
+                Action: ["s3:GetObject", "s3:PutObject"]
+                Resource: !Sub "arn:aws:s3:::${AWS::StackName}-src/*"
+
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ProcessorRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import urllib.parse
+
+          s3 = boto3.client("s3")
+
+          def handler(event, context):
+              for record in event.get("Records", []):
+                  bucket = record["s3"]["bucket"]["name"]
+                  key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
+                  dest_key = f"processed/{key}"
+                  s3.copy_object(Bucket=bucket, Key=dest_key,
+                                  CopySource={"Bucket": bucket, "Key": key})
+              return {"ok": True}
+
+  # NOTE: the resource-based permission MUST exist before the bucket's
+  # NotificationConfiguration is applied, otherwise S3 rejects the
+  # configuration with InvalidArgument ("Unable to validate destination
+  # configuration"). The explicit DependsOn on SourceBucket enforces this.
+  #
+  # The bucket name is derived from the stack name rather than !Ref SourceBucket
+  # so that the permission does not reference the bucket resource. Referencing it
+  # while the bucket DependsOn this permission creates a circular dependency
+  # (ProcessorRole -> SourceBucket -> ProcessorInvokePermission -> SourceBucket).
+  ProcessorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${AWS::StackName}-src"
+      SourceAccount: !Ref AWS::AccountId
+
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: ProcessorInvokePermission
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-src"
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Function: !GetAtt ProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: "incoming/"
+
+Outputs:
+  BucketName:
+    Value: !Ref SourceBucket
+  FunctionName:
+    Value: !Ref ProcessorFunction
+  FunctionArn:
+    Value: !GetAtt ProcessorFunction.Arn

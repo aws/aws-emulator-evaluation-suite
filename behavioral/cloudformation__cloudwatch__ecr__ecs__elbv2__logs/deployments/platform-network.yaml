@@ -1,0 +1,98 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Network child: the ALB and task security groups, the internet-facing ALB, its listener and the
+  ip-type target group the service child registers into. Reuses the account's DEFAULT VPC and builds no NAT gateway and no
+  EIP, so an interrupted teardown cannot leave billable networking behind.
+
+Parameters:
+  VpcId:
+    Type: String
+  SubnetIds:
+    Type: CommaDelimitedList
+    Description: Passed as a joined string by the parent; two subnets in different AZs.
+  LoadBalancerName:
+    Type: String
+  TargetGroupName:
+    Type: String
+  SecurityGroupName:
+    Type: String
+  IngressPrefixListId:
+    Type: String
+    Description: The runner's egress CIDRs; the only source the load balancer admits.
+
+Resources:
+  IngressGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Ref SecurityGroupName
+      GroupDescription: sim2real xsvc nested-stack platform HTTP ingress
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourcePrefixListId: !Ref IngressPrefixListId
+
+  # The service's tasks admit tcp/80 only from the load balancer's group.
+  TaskGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: sim2real xsvc nested-stack platform task ingress from the ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !GetAtt IngressGroup.GroupId
+
+  # TargetType ip, because a Fargate task registers its awsvpc ENI address rather than an instance id.
+  ServiceTargets:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Ref TargetGroupName
+      VpcId: !Ref VpcId
+      TargetType: ip
+      Port: 80
+      Protocol: HTTP
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '10'
+
+  PlatformBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Ref LoadBalancerName
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !Ref IngressGroup
+
+  PlatformListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref PlatformBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ServiceTargets
+
+Outputs:
+  LoadBalancerDns:
+    Value: !GetAtt PlatformBalancer.DNSName
+  LoadBalancerArn:
+    Value: !Ref PlatformBalancer
+  TargetGroupArn:
+    Value: !Ref ServiceTargets
+  SecurityGroupId:
+    Value: !GetAtt TaskGroup.GroupId
+  ListenerArn:
+    Value: !Ref PlatformListener

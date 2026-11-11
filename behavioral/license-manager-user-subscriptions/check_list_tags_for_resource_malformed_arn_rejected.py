@@ -1,0 +1,87 @@
+"""list-tags-for-resource-malformed-arn-rejected."""
+from __future__ import annotations
+
+from behavioral_harness import tags
+
+CHECK = "list-tags-for-resource-malformed-arn-rejected"
+GROUP = "error-semantics"
+SERVICES = ["license-manager-user-subscriptions"]
+
+
+@tags("axis:rejection", "cap:c1", "concern:negative-classes", "plane:control")
+def run(ctx) -> None:
+    """ListTagsForResource raises BadRequestException "Invalid input resource arn: bad syntax" for a malformed
+    ARN and BadRequestException "Invalid input resource arn" for a well-formed but never-created one."""
+    lmus = ctx.client("license-manager-user-subscriptions")
+    _ensure_slr(ctx)
+
+    code, message = _error(lambda: lmus.list_tags_for_resource(ResourceArn="not-an-arn"))
+    assert code == "BadRequestException", f"expected BadRequestException for a malformed ResourceArn, got {code!r}"
+    assert message == "Invalid input resource arn: bad syntax", f"unexpected message: {message!r}"
+
+    arn = _fake_arn(ctx, "identity-provider", ctx.unique_name("sim2real-idp-"))
+    code2, message2 = _error(lambda: lmus.list_tags_for_resource(ResourceArn=arn))
+    assert code2 == "BadRequestException", (
+        f"expected BadRequestException for a well-formed but never-created ResourceArn, got {code2!r}"
+    )
+    assert message2 == "Invalid input resource arn", f"unexpected message: {message2!r}"
+
+
+def _error(fn):
+    """Call fn(); return its botocore (code, message). An unexpected SUCCESS raises, because an
+    emulator ACCEPTING input real AWS refuses is the strongest signal available."""
+    from botocore.exceptions import ClientError
+
+    try:
+        result = fn()
+    except ClientError as exc:
+        return exc.response["Error"]["Code"].split(",")[0].strip(), exc.response["Error"].get("Message", "")
+    raise AssertionError(f"real AWS rejects this call, but it SUCCEEDED and returned {result!r}")
+
+
+def _account_id(ctx):
+    return ctx.client("sts").get_caller_identity()["Account"]
+
+
+def _fake_arn(ctx, resource_type, resource_id):
+    return f"arn:aws:license-manager-user-subscriptions:{ctx.region}:{_account_id(ctx)}:{resource_type}/{resource_id}"
+
+
+def _ensure_slr(ctx):
+    """license-manager-user-subscriptions API calls require the
+    AWSServiceRoleForAWSLicenseManagerUserSubscriptionsService service-linked role to
+    exist in the account; without it every call is rejected with
+    AccessDeniedException("Service Linked role is not present") before the service
+    ever evaluates the request. Create it idempotently, then poll a cheap real call
+    until the role has actually propagated -- IAM's eventual consistency means the
+    license-manager-user-subscriptions API can still see the role as absent for a
+    few seconds right after CreateServiceLinkedRole returns."""
+    import time
+
+    from botocore.exceptions import ClientError
+
+    iam = ctx.client("iam")
+    try:
+        iam.create_service_linked_role(AWSServiceName="license-manager-user-subscriptions.amazonaws.com")
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "InvalidInput":
+            raise
+
+    lmus_probe = ctx.client("license-manager-user-subscriptions")
+    deadline = time.monotonic() + 60.0
+    while time.monotonic() < deadline:
+        try:
+            lmus_probe.list_instances(MaxResults=1)
+            return
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "AccessDeniedException" and "Service Linked role" in str(exc):
+                time.sleep(3.0)
+                continue
+            return
+
+
+if __name__ == "__main__":
+    from fidelity_tests_runner import main
+
+    main(run)
+

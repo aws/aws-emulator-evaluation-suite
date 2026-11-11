@@ -1,0 +1,275 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >-
+  Order-intake reference application, SAM flavor. The application is the same one the cfn / cdk /
+  terraform modules build; what differs is that the API method, the integration, the
+  lambda:InvokeFunction permission and the SQS event-source mapping are all left to the
+  AWS::Serverless-2016-10-31 transform to expand from two Events blocks, so the expansion itself is
+  part of what the check grades. Deployed through create_stack/update_stack with
+  CAPABILITY_AUTO_EXPAND rather than `sam deploy`, so no packaging step and no artifact bucket sit
+  between the template and the stack.
+
+  The roles, the table, the queue, the log groups, the alarm and both handler bodies are declared as
+  plain CloudFormation resources, byte-identical to the cfn flavor's: the transform is the ONLY
+  difference, which is what makes a divergence attributable to it.
+
+Parameters:
+  TableName:
+    Type: String
+  QueueName:
+    Type: String
+  IntakeFunctionName:
+    Type: String
+  WorkerFunctionName:
+    Type: String
+  IntakeRoleName:
+    Type: String
+  WorkerRoleName:
+    Type: String
+  ApiName:
+    Type: String
+  StageName:
+    Type: String
+  AlarmName:
+    Type: String
+  MetricNamespace:
+    Type: String
+  IntakeMemorySize:
+    Type: Number
+    Description: >-
+      The drift knob. The second apply raises it, and an in-place update is the expected outcome:
+      nothing else in the application may be replaced as a consequence.
+
+Resources:
+  Table:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref QueueName
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 3600
+
+  IntakeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${IntakeFunctionName}"
+      RetentionInDays: 1
+
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${WorkerFunctionName}"
+      RetentionInDays: 1
+
+  # Named roles supplied EXPLICITLY, so the transform generates none of its own: the denial leg has
+  # to know the worker role's name to attach a Deny to it, and a transform-generated role name is
+  # not knowable before the stack exists.
+  IntakeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref IntakeRoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: intake
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt Table.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt Queue.Arn
+
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref WorkerRoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: worker
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt Table.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt Queue.Arn
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Ref ApiName
+      StageName: !Ref StageName
+      EndpointConfiguration:
+        Type: REGIONAL
+
+  IntakeFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: IntakeLogGroup
+    Properties:
+      FunctionName: !Ref IntakeFunctionName
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt IntakeRole.Arn
+      MemorySize: !Ref IntakeMemorySize
+      Timeout: 20
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          QUEUE_URL: !Ref Queue
+      # The transform expands this into the Method, the AWS_PROXY Integration and the
+      # lambda:InvokeFunction permission the cfn flavor writes out by hand.
+      Events:
+        PostOrders:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /orders
+            Method: post
+      InlineCode: |
+        import json
+        import os
+        import boto3
+
+        _ddb = boto3.client("dynamodb")
+        _sqs = boto3.client("sqs")
+
+
+        def handler(event, context):
+            body = json.loads(event.get("body") or "{}")
+            order_id = body["orderId"]
+            _ddb.put_item(
+                TableName=os.environ["TABLE_NAME"],
+                Item={"orderId": {"S": order_id}, "status": {"S": "received"}},
+            )
+            _sqs.send_message(
+                QueueUrl=os.environ["QUEUE_URL"],
+                MessageBody=json.dumps({"orderId": order_id}),
+            )
+            print(json.dumps({"app": "order-intake", "stage": "intake", "orderId": order_id, "status": "received"}))
+            return {
+                "statusCode": 202,
+                "headers": {"content-type": "application/json"},
+                "body": json.dumps({"orderId": order_id, "status": "received"}),
+            }
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: WorkerLogGroup
+    Properties:
+      FunctionName: !Ref WorkerFunctionName
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt WorkerRole.Arn
+      MemorySize: 128
+      Timeout: 20
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          METRIC_NAMESPACE: !Ref MetricNamespace
+      # Expanded into the AWS::Lambda::EventSourceMapping the cfn flavor declares directly.
+      Events:
+        FromQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt Queue.Arn
+            BatchSize: 1
+      InlineCode: |
+        import json
+        import os
+        import boto3
+        from botocore.exceptions import ClientError
+
+        _ddb = boto3.client("dynamodb")
+        _cw = boto3.client("cloudwatch")
+
+
+        def handler(event, context):
+            for record in event.get("Records", []):
+                order_id = json.loads(record["body"])["orderId"]
+                try:
+                    _ddb.update_item(
+                        TableName=os.environ["TABLE_NAME"],
+                        Key={"orderId": {"S": order_id}},
+                        UpdateExpression="SET #s = :s",
+                        ExpressionAttributeNames={"#s": "status"},
+                        ExpressionAttributeValues={":s": {"S": "fulfilled"}},
+                        ConditionExpression="attribute_exists(orderId)",
+                    )
+                except ClientError as exc:
+                    # Reported and CONSUMED, not re-raised -- see the cfn flavor's copy of this
+                    # handler for why a re-raise would let the denied message be fulfilled
+                    # retroactively once the Deny is removed.
+                    code = exc.response["Error"]["Code"]
+                    print(json.dumps({"app": "order-intake", "stage": "worker", "orderId": order_id, "status": "denied", "op": "UpdateItem", "code": code, "message": exc.response["Error"].get("Message")}))
+                    continue
+                _cw.put_metric_data(
+                    Namespace=os.environ["METRIC_NAMESPACE"],
+                    MetricData=[{"MetricName": "OrdersFulfilled", "Value": 1.0, "Unit": "Count"}],
+                )
+                print(json.dumps({"app": "order-intake", "stage": "worker", "orderId": order_id, "status": "fulfilled"}))
+            return {"ok": True}
+
+  FulfilledAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Ref AlarmName
+      Namespace: !Ref MetricNamespace
+      MetricName: OrdersFulfilled
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: missing
+      ActionsEnabled: false
+
+Outputs:
+  ApiId:
+    Value: !Ref Api

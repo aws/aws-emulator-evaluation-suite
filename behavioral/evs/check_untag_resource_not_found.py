@@ -1,0 +1,41 @@
+"""untag-resource-not-found."""
+from __future__ import annotations
+
+from behavioral_harness import tags
+
+CHECK = "untag-resource-not-found"
+GROUP = "errors"
+SERVICES = ["evs"]
+
+
+@tags("axis:rejection", "cap:c1", "concern:negative-classes", "plane:control")
+def run(ctx) -> None:
+    """UntagResource against an environment ARN that does not exist (but is in the
+    caller's own account/region) raises ResourceNotFoundException."""
+    evs = ctx.client("evs")
+    account_id = ctx.account
+    fake_arn = f"arn:aws:evs:{ctx.region}:{account_id}:environment/env-0000000000"
+    code, message = _error(
+        lambda: evs.untag_resource(resourceArn=fake_arn, tagKeys=["sim2real-key"])
+    )
+    assert code == "ResourceNotFoundException", (
+        f"expected UntagResource on a nonexistent environment ARN to raise "
+        f"ResourceNotFoundException, got error code {code!r}"
+    )
+    assert message == "Resource cannot be found.", f"unexpected message {message!r}"
+
+
+def _error(fn):
+    """Call fn(); return its botocore error (code, message). An unexpected SUCCESS raises."""
+    from botocore.exceptions import ClientError
+
+    try:
+        result = fn()
+    except ClientError as exc:
+        error = exc.response["Error"]
+        return error["Code"], error.get("Message", "")
+    raise AssertionError(f"real AWS rejects this call, but it SUCCEEDED and returned {result!r}")
+
+if __name__ == "__main__":
+    from fidelity_tests_runner import main
+    main(run)

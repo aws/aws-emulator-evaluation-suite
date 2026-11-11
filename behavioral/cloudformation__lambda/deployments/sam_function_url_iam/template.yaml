@@ -1,0 +1,27 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  FunctionName:
+    Type: String
+Resources:
+  Fn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Runtime: python3.13
+      Handler: index.handler
+      InlineCode: |
+        import json
+
+
+        def handler(event, context):
+            identity = event["requestContext"]["authorizer"]["iam"]
+            body = {"accountId": identity.get("accountId"), "accessKey": identity.get("accessKey"),
+                    "marker": "sim2real-sam-url"}
+            return {"statusCode": 200, "headers": {"content-type": "application/json"},
+                    "body": json.dumps(body)}
+      FunctionUrlConfig:
+        AuthType: AWS_IAM
+Outputs:
+  FunctionUrl:
+    Value: !GetAtt FnUrl.FunctionUrl

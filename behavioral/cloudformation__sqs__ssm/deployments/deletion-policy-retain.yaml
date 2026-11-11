@@ -1,0 +1,65 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Two SQS queues and two SSM parameters that differ in exactly one way: one of each
+  carries DeletionPolicy: Retain. Deleting this stack must leave the retained pair
+  behind and destroy the default-policy pair.
+
+Parameters:
+  RetainedQueueName:
+    Type: String
+    Description: Name of the queue that must survive the stack delete.
+  DefaultQueueName:
+    Type: String
+    Description: Name of the twin queue that must be destroyed with the stack.
+  RetainedParameterName:
+    Type: String
+    Description: Name of the SSM parameter that must survive the stack delete.
+  DefaultParameterName:
+    Type: String
+    Description: Name of the twin SSM parameter that must be destroyed with the stack.
+  ParameterValue:
+    Type: String
+    Description: Value stored in both parameters, read back after the delete.
+
+Resources:
+  RetainedQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      QueueName: !Ref RetainedQueueName
+      # Non-default on purpose: proves the surviving queue keeps the properties
+      # CloudFormation gave it, rather than being a fresh queue of the same name.
+      VisibilityTimeout: 31
+
+  DefaultQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref DefaultQueueName
+      VisibilityTimeout: 31
+
+  RetainedParameter:
+    Type: AWS::SSM::Parameter
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Ref RetainedParameterName
+      Type: String
+      Value: !Ref ParameterValue
+
+  DefaultParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Ref DefaultParameterName
+      Type: String
+      Value: !Ref ParameterValue
+
+Outputs:
+  RetainedQueueUrl:
+    Value: !Ref RetainedQueue
+  DefaultQueueUrl:
+    Value: !Ref DefaultQueue
+  RetainedQueueArn:
+    Value: !GetAtt RetainedQueue.Arn
+  RetainedParameterNameOut:
+    Value: !Ref RetainedParameter

@@ -1,0 +1,30 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  FunctionName:
+    Type: String
+Resources:
+  Fn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Runtime: python3.13
+      Handler: index.handler
+      InlineCode: |
+        def handler(event, context):
+            print("MARKER=" + event.get("detail", {}).get("token", "none"))
+      Events:
+        Match:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - sim2real.custom
+              detail-type:
+                - sim2real.marker
+              detail:
+                kind:
+                  - match-me
+Outputs:
+  FunctionArn:
+    Value: !GetAtt Fn.Arn

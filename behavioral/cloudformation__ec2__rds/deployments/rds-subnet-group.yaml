@@ -1,0 +1,64 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  A VPC with two subnets and an RDS DB subnet group over them. SingleAz=true puts both
+  subnets in the SAME availability zone, which RDS must refuse
+  (DBSubnetGroupDoesNotCoverEnoughAZs); SingleAz=false spreads them over two zones,
+  which must succeed. No DB instance is created, so the stack costs nothing.
+
+Parameters:
+  SubnetGroupName:
+    Type: String
+    Description: Name of the DB subnet group.
+  SingleAz:
+    Type: String
+    AllowedValues:
+      - "true"
+      - "false"
+    Default: "false"
+    Description: When true, both subnets are placed in the first availability zone.
+
+Conditions:
+  OneZone: !Equals [!Ref SingleAz, "true"]
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.31.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.31.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+
+  # The ONLY difference between the two legs: which zone this subnet lands in.
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.31.2.0/24
+      AvailabilityZone:
+        !If [OneZone, !Select [0, !GetAZs ""], !Select [1, !GetAZs ""]]
+
+  SubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Ref SubnetGroupName
+      DBSubnetGroupDescription: sim2real parity check for DB subnet group AZ coverage
+      SubnetIds:
+        - !Ref SubnetA
+        - !Ref SubnetB
+
+Outputs:
+  SubnetGroupNameOut:
+    Value: !Ref SubnetGroup
+  VpcId:
+    Value: !Ref Vpc
+  SubnetAId:
+    Value: !Ref SubnetA
+  SubnetBId:
+    Value: !Ref SubnetB

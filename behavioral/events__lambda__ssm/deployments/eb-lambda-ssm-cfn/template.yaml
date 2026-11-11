@@ -1,0 +1,98 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  events -> lambda -> ssm pipeline. An EventBridge rule (on the default bus)
+  matching a caller-supplied source invokes a Lambda whose execution role can
+  write one SSM parameter. Exercises deployment ordering: the rule, the
+  function and the lambda:InvokeFunction resource policy must all be live when
+  the stack reaches CREATE_COMPLETE, with the rule ARN resolved via !GetAtt for
+  the permission's SourceArn.
+
+Parameters:
+  ParameterName:
+    Type: String
+    Description: Name of the SSM parameter the Lambda writes to.
+  EventSourceName:
+    Type: String
+    Description: The EventBridge event "source" the rule matches on.
+
+Resources:
+  TargetParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Ref ParameterName
+      Type: String
+      Value: "initial"
+
+  WriterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ssm-write-and-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: Allow
+                Action: ["ssm:PutParameter"]
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterName}"
+
+  WriterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt WriterRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          PARAM_NAME: !Ref ParameterName
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+
+          ssm = boto3.client("ssm")
+
+          def handler(event, context):
+              ssm.put_parameter(
+                  Name=os.environ["PARAM_NAME"],
+                  Value="written-by-cfn-lambda",
+                  Type="String",
+                  Overwrite=True,
+              )
+              return {"ok": True}
+
+  TriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - !Ref EventSourceName
+      State: ENABLED
+      Targets:
+        - Id: writer-target
+          Arn: !GetAtt WriterFunction.Arn
+
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WriterFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TriggerRule.Arn
+
+Outputs:
+  ParameterName:
+    Value: !Ref TargetParameter
+  RuleArn:
+    Value: !GetAtt TriggerRule.Arn
+  FunctionArn:
+    Value: !GetAtt WriterFunction.Arn

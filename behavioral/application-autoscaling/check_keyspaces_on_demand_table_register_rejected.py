@@ -1,0 +1,203 @@
+"""keyspaces-on-demand-table-register-rejected."""
+from __future__ import annotations
+
+import datetime
+import time
+
+from botocore.exceptions import ClientError
+
+from behavioral_harness import tags
+
+CHECK = "keyspaces-on-demand-table-register-rejected"
+GROUP = 'scalable-targets'
+SERVICES = ['application-autoscaling']
+
+_NS = 'cassandra'
+_READ = 'cassandra:table:ReadCapacityUnits'
+
+
+def _error(fn):
+    """(code, message) of the ClientError ``fn`` raises; an unexpected success raises."""
+    try:
+        result = fn()
+    except ClientError as exc:
+        return exc.response['Error']['Code'], exc.response['Error'].get('Message')
+    raise AssertionError(f'expected the call to be refused, but it succeeded: {result!r}')
+
+
+@tags('axis:rejection', 'cap:c1', 'concern:negative-classes', 'plane:control')
+def run(ctx) -> None:
+    """RegisterScalableTarget refuses an on-demand Keyspaces table (no capacity to scale)
+    naming the table and registers nothing; once switched to PROVISIONED the same call registers.
+    """
+    ks = ctx.client('keyspaces')
+    aas = ctx.client('application-autoscaling')
+    keyspace, table = _keyspaces_table(ctx, read=None, write=None)
+    resource_id = f'keyspace/{keyspace}/table/{table}'
+    ctx.on_cleanup(lambda: _deregister(aas, resource_id, _READ))
+
+    register = lambda: aas.register_scalable_target(  # noqa: E731
+        ServiceNamespace=_NS, ResourceId=resource_id, ScalableDimension=_READ,
+        MinCapacity=1, MaxCapacity=5)
+    code, message = _error(register)
+    assert code == 'ValidationException', f'an on-demand table was refused with {code!r}'
+    expected = (f'Validation failed for scalable target. Reason: Table {table} must be in '
+                f'PROVISIONED throughput mode')
+    assert message == expected, f'refusal message {message!r}, expected {expected!r}'
+    assert _bounds(aas, resource_id) is None, 'the on-demand table is registered anyway'
+
+    # Positive control: the same table, switched to PROVISIONED, registers with the same call.
+    ks.update_table(keyspaceName=keyspace, tableName=table,
+                    capacitySpecification={'throughputMode': 'PROVISIONED',
+                                           'readCapacityUnits': 1, 'writeCapacityUnits': 1})
+    _poll_until(lambda: ks.get_table(keyspaceName=keyspace, tableName=table),
+                lambda t: t['status'] == 'ACTIVE'
+                and t['capacitySpecification']['throughputMode'] == 'PROVISIONED',
+                timeout_s=300, interval_s=5.0,
+                description=f'table {table!r} ACTIVE in PROVISIONED mode')
+    register()
+    assert _bounds(aas, resource_id) == (1, 5), (
+        f'the provisioned table registered with bounds {_bounds(aas, resource_id)!r}, '
+        f'expected (1, 5)')
+
+
+def _bounds(aas, resource_id):
+    found = []
+    for page in aas.get_paginator('describe_scalable_targets').paginate(
+            ServiceNamespace=_NS, ResourceIds=[resource_id], ScalableDimension=_READ):
+        found.extend((t['MinCapacity'], t['MaxCapacity']) for t in page['ScalableTargets'])
+    assert len(found) <= 1, f'{len(found)} targets share one resource id'
+    return found[0] if found else None
+
+
+def _poll_until(probe, predicate, *, timeout_s, interval_s=5.0, description='condition'):
+    """Bounded retry with a deadline that RAISES on timeout, never returns its last value."""
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while time.monotonic() < deadline:
+        last = probe()
+        if predicate(last):
+            return last
+        time.sleep(interval_s)
+    raise AssertionError(f'{description} not observed within {timeout_s}s; last saw {last!r}')
+
+
+def _keyspaces_table(ctx, *, read, write):
+    """A fresh keyspace holding one PROVISIONED table, both ACTIVE; returns (keyspace, table)."""
+    ks = ctx.client('keyspaces')
+    keyspace = ctx.unique_name('sim2real_aas_ks_')
+    table = 'sim2real_t'
+    ks.create_keyspace(keyspaceName=keyspace, tags=[{'key': 'sim2real', 'value': CHECK}])
+    ctx.on_cleanup(lambda: _delete_keyspace(ks, keyspace))
+    _poll_until(lambda: _keyspace_exists(ks, keyspace), bool, timeout_s=120, interval_s=3.0,
+                description=f'keyspace {keyspace!r} becoming readable')
+    ks.create_table(
+        keyspaceName=keyspace, tableName=table,
+        schemaDefinition={'allColumns': [{'name': 'pk', 'type': 'text'}],
+                          'partitionKeys': [{'name': 'pk'}]},
+        capacitySpecification=_capacity(read, write),
+        tags=[{'key': 'sim2real', 'value': CHECK}],
+    )
+    ctx.on_cleanup(lambda: _delete_table(ks, keyspace, table))
+    _poll_until(lambda: _table_status(ks, keyspace, table),
+                lambda s: s == 'ACTIVE', timeout_s=300, interval_s=5.0,
+                description=f'table {keyspace}.{table} becoming ACTIVE')
+    return keyspace, table
+
+
+def _table_status(ks, keyspace, table):
+    """The table's status; a table not yet readable after CreateTable reads as None."""
+    try:
+        return ks.get_table(keyspaceName=keyspace, tableName=table)['status']
+    except ClientError as exc:
+        if exc.response['Error']['Code'] != 'ResourceNotFoundException':
+            raise
+        return None
+
+
+def _keyspace_exists(ks, keyspace):
+    try:
+        ks.get_keyspace(keyspaceName=keyspace)
+        return True
+    except ClientError as exc:
+        if exc.response['Error']['Code'] != 'ResourceNotFoundException':
+            raise
+        return False
+
+
+def _delete_table(ks, keyspace, table):
+    deadline = time.monotonic() + 40
+    while True:
+        try:
+            ks.delete_table(keyspaceName=keyspace, tableName=table)
+            return
+        except ClientError as exc:
+            code = exc.response['Error']['Code']
+            if code == 'ResourceNotFoundException':
+                return
+            if code != 'ConflictException' or time.monotonic() > deadline:
+                raise
+            time.sleep(3)
+
+
+def _delete_keyspace(ks, keyspace):
+    """Delete the keyspace; a table still being deleted inside it is a ConflictException."""
+    deadline = time.monotonic() + 40
+    while True:
+        try:
+            ks.delete_keyspace(keyspaceName=keyspace)
+            return
+        except ClientError as exc:
+            code = exc.response['Error']['Code']
+            if code == 'ResourceNotFoundException':
+                return
+            if code != 'ConflictException' or time.monotonic() > deadline:
+                raise
+            time.sleep(3)
+
+
+def _deregister(aas, resource_id, dimension):
+    try:
+        aas.deregister_scalable_target(ServiceNamespace=_NS, ResourceId=resource_id,
+                                       ScalableDimension=dimension)
+    except ClientError as exc:
+        if exc.response['Error']['Code'] != 'ObjectNotFoundException':
+            raise
+
+
+def _activities(aas, resource_id, dimension):
+    out, token = [], None
+    while True:
+        kwargs = {'ServiceNamespace': _NS, 'ResourceId': resource_id,
+                  'ScalableDimension': dimension}
+        if token:
+            kwargs['NextToken'] = token
+        page = aas.describe_scaling_activities(**kwargs)
+        out.extend(page['ScalingActivities'])
+        token = page.get('NextToken')
+        if not token:
+            return out
+
+
+def _next_minute_at(min_lead_s=30):
+    """A one-time at() expression for the next whole UTC minute at least ``min_lead_s`` away."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    fire = now.replace(second=0, microsecond=0) + datetime.timedelta(minutes=1)
+    if (fire - now).total_seconds() < min_lead_s:
+        fire += datetime.timedelta(minutes=1)
+    return f'at({fire:%Y-%m-%dT%H:%M:%S})', fire
+
+
+
+
+def _capacity(read, write):
+    """PROVISIONED at (read, write), or on-demand when both are None."""
+    if read is None and write is None:
+        return {'throughputMode': 'PAY_PER_REQUEST'}
+    return {'throughputMode': 'PROVISIONED', 'readCapacityUnits': read,
+            'writeCapacityUnits': write}
+
+
+if __name__ == '__main__':
+    from fidelity_tests_runner import main
+    main(run)

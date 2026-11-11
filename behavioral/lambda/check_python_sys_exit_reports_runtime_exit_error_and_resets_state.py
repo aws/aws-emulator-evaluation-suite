@@ -1,0 +1,229 @@
+"""python-sys-exit-reports-runtime-exit-error-and-resets-state."""
+from __future__ import annotations
+
+import io
+import json
+import time
+import zipfile
+
+from botocore.exceptions import ClientError
+
+from behavioral_harness import tags
+
+CHECK = "python-sys-exit-reports-runtime-exit-error-and-resets-state"
+GROUP = "python-runtime"
+SERVICES = ["lambda"]
+
+_HANDLER = """\
+import os
+import sys
+
+CALLS = 0
+
+
+def handler(event, context):
+    global CALLS
+    CALLS += 1
+    if event.get("exit") is not None:
+        sys.exit(event["exit"])
+    if event.get("os_exit") is not None:
+        os._exit(event["os_exit"])
+    return {"calls": CALLS}
+"""
+
+
+def _died(lam, fn, event):
+    r = _invoke(lam, fn, json.dumps(event).encode())
+    assert r["status"] == 200, f"{event}: StatusCode {r['status']!r}; a function error is 200"
+    assert r["error"] == "Unhandled", (
+        f"{event}: FunctionError={r['error']!r}, expected 'Unhandled'; body {r['raw'][:300]!r}"
+    )
+    return r, json.loads(r["raw"])
+
+
+_TRUST = {
+    "Version": "2012-10-17",
+    "Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"},
+                   "Action": "sts:AssumeRole"}],
+}
+
+
+def _zip(files: dict) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, body in files.items():
+            zf.writestr(name, body)
+    return buf.getvalue()
+
+
+def _teardown(undo, *not_found: str):
+    """A cleanup running ``undo()`` where a failed delete raises; only ``not_found`` means gone."""
+
+    def run_undo() -> None:
+        try:
+            undo()
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] in not_found:
+                return
+            raise
+
+    return run_undo
+
+
+def _reap_log_group(logs, name: str, *, reads: int = 2, interval_s: float = 2.0,
+                    budget_s: float = 40.0) -> None:
+    """Delete log group ``name`` until ``reads`` consecutive reads find it absent; raise if not."""
+    deadline = time.monotonic() + budget_s
+    absent = 0
+    while absent < reads:
+        groups = logs.describe_log_groups(logGroupNamePrefix=name)["logGroups"]
+        if any(g["logGroupName"] == name for g in groups):
+            absent = 0
+            try:
+                logs.delete_log_group(logGroupName=name)
+            except ClientError as exc:
+                if exc.response["Error"]["Code"] != "ResourceNotFoundException":
+                    raise
+        else:
+            absent += 1
+        if absent < reads:
+            if time.monotonic() > deadline:
+                raise AssertionError(
+                    f"log group still present after {budget_s}s of deletes; {absent} clean reads"
+                )
+            time.sleep(interval_s)
+
+
+def _role(ctx) -> str:
+    """An execution role this check owns. It grants nothing, so the function writes no logs."""
+    iam = ctx.client("iam")
+    name = ctx.unique_name("sim2real-behav-pyrt-")
+    arn = iam.create_role(
+        RoleName=name, AssumeRolePolicyDocument=json.dumps(_TRUST),
+        Tags=[{"Key": "sim2real", "Value": CHECK}],
+    )["Role"]["Arn"]
+    ctx.on_cleanup(_teardown(lambda: iam.delete_role(RoleName=name), "NoSuchEntity"))
+    return arn
+
+
+def _wait_ready(lam, fn: str, timeout_s: float = 120.0) -> dict:
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while time.monotonic() < deadline:
+        last = lam.get_function_configuration(FunctionName=fn)
+        if last["State"] == "Failed" or last.get("LastUpdateStatus") == "Failed":
+            raise AssertionError(f"{fn} failed: {last.get('StateReason')!r} "
+                                 f"{last.get('LastUpdateStatusReason')!r}")
+        if last["State"] == "Active" and last.get("LastUpdateStatus") in (None, "Successful"):
+            return last
+        time.sleep(1.0)
+    raise AssertionError(f"{fn} never became Active/Successful in {timeout_s}s; last={last!r}")
+
+
+def _deploy(ctx, lam, role: str, files: dict, *, handler: str = "index.handler",
+            runtime: str = "python3.12", timeout: int = 10, memory: int = 128,
+            environment: dict | None = None) -> str:
+    """Create a zip-packaged function, register its teardown, and wait until it is Active."""
+    fn = ctx.unique_name("sim2real-behav-pyrt-")
+    logs = ctx.client("logs")
+    ctx.on_cleanup(lambda: _reap_log_group(logs, f"/aws/lambda/{fn}"))
+    kwargs = dict(FunctionName=fn, Role=role, Runtime=runtime, Handler=handler,
+                  Code={"ZipFile": _zip(files)}, Timeout=timeout, MemorySize=memory,
+                  Tags={"sim2real": CHECK})
+    if environment is not None:
+        kwargs["Environment"] = {"Variables": environment}
+    deadline = time.monotonic() + 120
+    while True:
+        try:
+            lam.create_function(**kwargs)
+            break
+        except ClientError as exc:
+            # IAM propagation exposes no pollable condition; the bounded retry is the fix.
+            if "cannot be assumed" in exc.response["Error"].get("Message", "") \
+                    and time.monotonic() < deadline:
+                time.sleep(3)
+                continue
+            raise
+    ctx.on_cleanup(_teardown(lambda: lam.delete_function(FunctionName=fn),
+                             "ResourceNotFoundException"))
+    _wait_ready(lam, fn)
+    return fn
+
+
+def _invoke(lam, fn: str, payload: bytes | None = b"{}", **kwargs) -> dict:
+    """A RequestResponse invoke, returning status, function error, request id and raw body."""
+    args = dict(FunctionName=fn, InvocationType="RequestResponse", **kwargs)
+    if payload is not None:
+        args["Payload"] = payload
+    resp = lam.invoke(**args)
+    return {
+        "status": resp["StatusCode"],
+        "error": resp.get("FunctionError"),
+        "version": resp.get("ExecutedVersion"),
+        "request_id": resp["ResponseMetadata"]["RequestId"],
+        "raw": resp["Payload"].read(),
+    }
+
+
+def _ok(lam, fn: str, payload: bytes | None = b"{}", **kwargs):
+    """The parsed body of an invoke that must succeed."""
+    r = _invoke(lam, fn, payload, **kwargs)
+    assert r["status"] == 200 and r["error"] is None, (
+        f"{fn}: expected a clean 200, got status={r['status']!r} FunctionError={r['error']!r} "
+        f"body={r['raw'][:400]!r}"
+    )
+    return json.loads(r["raw"])
+
+
+@tags("axis:happy-path", "cap:c3", "concern:data-plane", "concern:negative-classes", "dp:api",
+      "plane:data")
+def run(ctx) -> None:
+    """A Python handler that exits the process fails with Runtime.ExitError "RequestId: <id> Error:
+    Runtime exited with error: exit status N" (or "without providing a reason" for 0), and the next
+    invoke runs a freshly initialised runtime whose module call counter restarts at 1.
+    """
+    lam = ctx.client("lambda")
+    fn = _deploy(ctx, lam, _role(ctx), {"index.py": _HANDLER})
+
+    first = _ok(lam, fn)
+    assert first == {"calls": 1}, f"first invoke of a new function: {first!r}"
+    warm = _ok(lam, fn)
+    assert warm == {"calls": 2}, (
+        f"a second ordinary invoke must reuse the same warm environment and keep incrementing the "
+        f"module-level counter, got {warm!r}; otherwise a target that never persists state at all "
+        f"could pass this check's later resets vacuously"
+    )
+
+    for event, reason in (
+        ({"exit": 1}, "Runtime exited with error: exit status 1"),
+        ({"exit": 0}, "Runtime exited without providing a reason"),
+        ({"os_exit": 3}, "Runtime exited with error: exit status 3"),
+    ):
+        r, body = _died(lam, fn, event)
+        assert set(body) == {"errorType", "errorMessage"}, f"{event}: keys {sorted(body)!r}"
+        assert body["errorType"] == "Runtime.ExitError", (
+            f"{event}: errorType {body['errorType']!r}, expected 'Runtime.ExitError'"
+        )
+        want = f"RequestId: {r['request_id']} Error: {reason}"
+        assert body["errorMessage"] == want, (
+            f"{event}: errorMessage {body['errorMessage']!r}, expected the invoke's request id "
+            f"and {reason!r}"
+        )
+        # The process that counted the fatal call is gone; init ran again.
+        again = _ok(lam, fn)
+        assert again == {"calls": 1}, (
+            f"after {event} the next invoke reported {again!r}; module state must not survive a "
+            f"runtime exit"
+        )
+        # The freshly initialised environment is itself warm: it is the reset that is special,
+        # not an inability of this function to ever keep state.
+        warm_after = _ok(lam, fn)
+        assert warm_after == {"calls": 2}, (
+            f"after {event} the freshly initialised environment must go on to reuse its own warm "
+            f"state on its next invoke, got {warm_after!r}"
+        )
+
+
+if __name__ == "__main__":
+    from fidelity_tests_runner import main
+    main(run)

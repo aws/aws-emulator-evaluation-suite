@@ -1,0 +1,235 @@
+"""deploy-configuration-bundle-round-trip-then-stack-delete."""
+from __future__ import annotations
+
+import json
+import time
+
+from botocore.exceptions import ClientError
+
+from behavioral_harness import tags
+
+CHECK = "deploy-configuration-bundle-round-trip-then-stack-delete"
+GROUP = "deploy"
+SERVICES = ["bedrock-agentcore-control", "cloudformation"]
+
+# ---- CloudFormation helpers ----
+
+_TERMINAL = frozenset({
+    "CREATE_COMPLETE", "CREATE_FAILED", "ROLLBACK_COMPLETE", "ROLLBACK_FAILED",
+    "DELETE_COMPLETE", "DELETE_FAILED", "UPDATE_COMPLETE", "UPDATE_ROLLBACK_COMPLETE",
+    "UPDATE_FAILED", "UPDATE_ROLLBACK_FAILED", "IMPORT_COMPLETE", "IMPORT_ROLLBACK_COMPLETE",
+    "IMPORT_ROLLBACK_FAILED",
+})
+_DELETE_BUDGET_S = 600.0  # per stack; at most two stacks fit the suites' 1800 s cleanup budget
+
+
+def paginate(client, op, key, **kw):
+    """Every item under ``key`` across all pages of ``op``; presence and absence read every page.
+
+    A ``key`` the operation's output does not declare fails instead of reading as [].
+    """
+    model = client.meta.service_model.operation_model(client.meta.method_to_api_mapping[op])
+    assert key in model.output_shape.members, f"{op} output has no member {key!r}"
+    return [x for page in client.get_paginator(op).paginate(**kw) for x in page.get(key, [])]
+
+
+def wait_stack(cf, stack_id, terminal=_TERMINAL, timeout_s=300.0):
+    """Poll DescribeStacks by StackId every 2 s until a status in ``terminal``; return it.
+
+    Every error propagates: no ClientError ever stands for "done" or "gone".
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        status = cf.describe_stacks(StackName=stack_id)["Stacks"][0]["StackStatus"]
+        if status in terminal:
+            return status
+        if time.monotonic() > deadline:
+            raise AssertionError(f"stack {stack_id} still {status!r} after {timeout_s:.0f}s")
+        time.sleep(2)
+
+
+def delete_stack(cf, stack_id):
+    """Delete by StackId within one deadline; raise unless DELETE_COMPLETE. Safe to call twice.
+
+    A stack still creating or updating is first waited out; a failure names each resource's reason.
+    """
+    deadline = time.monotonic() + _DELETE_BUDGET_S
+    status = cf.describe_stacks(StackName=stack_id)["Stacks"][0]["StackStatus"]
+    if status == "DELETE_COMPLETE":
+        return
+    if status.endswith("_IN_PROGRESS") and status not in ("DELETE_IN_PROGRESS",
+                                                          "REVIEW_IN_PROGRESS"):
+        wait_stack(cf, stack_id, _TERMINAL, deadline - time.monotonic())
+    cf.delete_stack(StackName=stack_id)
+    status = wait_stack(cf, stack_id, {"DELETE_COMPLETE", "DELETE_FAILED"},
+                        deadline - time.monotonic())
+    if status != "DELETE_COMPLETE":
+        events = stack_events(cf, stack_id)
+        starts = [i for i, e in enumerate(events) if e.get("PhysicalResourceId") == stack_id
+                  and e["ResourceStatus"] == "DELETE_IN_PROGRESS"]
+        failed = [(e["LogicalResourceId"], e.get("ResourceStatusReason"))
+                  for e in events[starts[-1] if starts else 0:]
+                  if e["ResourceStatus"] == "DELETE_FAILED"]
+        raise AssertionError(f"stack {stack_id} delete ended {status!r}: {failed!r}")
+
+
+def delete_stack_named(cf, name, stack_id=None):
+    """delete_stack by ``stack_id``, else by the StackId DescribeStacks(StackName=name) returns.
+
+    A ``name`` CloudFormation never accepted ("does not exist") is nothing to delete; the
+    client's own ``ClientError`` keeps the helper free of imports.
+    """
+    if stack_id is None:
+        try:
+            stack_id = cf.describe_stacks(StackName=name)["Stacks"][0]["StackId"]
+        except cf.exceptions.ClientError as exc:
+            err = exc.response["Error"]
+            if (err.get("Code"), err.get("Message")) == (
+                    "ValidationError", f"Stack with id {name} does not exist"):
+                return
+            raise
+    delete_stack(cf, stack_id)
+
+
+def create_stack(ctx, cf, name, template, **kw):
+    """CreateStack tagged sim2real=<name> (propagates to every taggable resource); cleanup first.
+
+    ``name`` comes from ctx.unique_name("sim2real-..."), so the tag value is unique per run. The
+    cleanup is registered before the call: a stack AWS accepted is deleted even if the call raises.
+    """
+    created = {}
+    ctx.on_cleanup(lambda: delete_stack_named(cf, name, created.get("StackId")))
+    created["StackId"] = cf.create_stack(
+        StackName=name, TemplateBody=template, Tags=[{"Key": "sim2real", "Value": name}], **kw
+    )["StackId"]
+    return created["StackId"]
+
+
+def stack_outputs(cf, stack_id):
+    """The stack's Outputs as {OutputKey: OutputValue}."""
+    stack = cf.describe_stacks(StackName=stack_id)["Stacks"][0]
+    return {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+
+
+def stack_events(cf, stack_id):
+    """Every DescribeStackEvents row of the stack, oldest first."""
+    return paginate(cf, "describe_stack_events", "StackEvents", StackName=stack_id)[::-1]
+
+
+def decisive_rows(events, *logical_ids):
+    """``(logical id, status)`` of each non-IN_PROGRESS row, oldest first (subsequence asserts)."""
+    return [
+        (e["LogicalResourceId"], e["ResourceStatus"]) for e in events
+        if not e["ResourceStatus"].endswith("_IN_PROGRESS")
+        and (not logical_ids or e["LogicalResourceId"] in logical_ids)
+    ]
+
+
+def expect_error(fn, code, message, undo=None):
+    """Assert ``fn()`` raises exactly ``(code, message)``.
+
+    On an unexpected success ``undo(result)`` registers the cleanup before the failure is raised.
+    """
+    try:
+        result = fn()
+    except ClientError as exc:
+        got = (exc.response["Error"].get("Code"), exc.response["Error"].get("Message"))
+        assert got == (code, message), f"expected {(code, message)!r}, got {got!r}"
+        return
+    if undo is not None:
+        undo(result)
+    raise AssertionError(f"expected {code} but the call succeeded: {result!r}")
+
+
+# ---- Check-specific: the template, then run(). ----
+
+_NOT_FOUND = ("ResourceNotFoundException", "Configuration bundle not found")
+
+
+def _template(bundle_name):
+    return json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Bundle": {
+                "Type": "AWS::BedrockAgentCore::ConfigurationBundle",
+                "Properties": {
+                    "BundleName": bundle_name,
+                    "Components": {
+                        "sim2real_component": {
+                            "Configuration": {"enabled": True, "threshold": 7},
+                        },
+                    },
+                    "Tags": [{"Key": "sim2real-bundle", "Value": bundle_name}],
+                },
+            },
+        },
+        "Outputs": {
+            "BundleRef": {"Value": {"Ref": "Bundle"}},
+            "BundleId": {"Value": {"Fn::GetAtt": ["Bundle", "BundleId"]}},
+            "BundleArn": {"Value": {"Fn::GetAtt": ["Bundle", "BundleArn"]}},
+            "VersionId": {"Value": {"Fn::GetAtt": ["Bundle", "VersionId"]}},
+        },
+    })
+
+
+def _alnum_name(ctx, prefix: str) -> str:
+    raw = ctx.unique_name(prefix)
+    return "".join(ch for ch in raw if ch.isalnum() or ch == "_")
+
+
+@tags("axis:happy-path", "cap:c1", "concern:deploy", "concern:representation", "plane:control")
+def run(ctx) -> None:
+    """A CloudFormation ConfigurationBundle reads back through bedrock-agentcore-control.
+
+    Ref, GetAtt and every templated component match an independent list/get, and deleting the
+    stack removes the bundle.
+    """
+    cf = ctx.client("cloudformation")
+    control = ctx.client("bedrock-agentcore-control")
+
+    bundle_name = _alnum_name(ctx, "sim2realBundle")
+    stack = ctx.unique_name("sim2real-bundle-")
+
+    stack_id = create_stack(ctx, cf, stack, _template(bundle_name))
+    status = wait_stack(cf, stack_id)
+    assert status == "CREATE_COMPLETE", (
+        f"stack ended {status!r}: {decisive_rows(stack_events(cf, stack_id))!r}"
+    )
+    out = stack_outputs(cf, stack_id)
+
+    # Ref against an independent read (ListConfigurationBundles by the declared name).
+    listed = [b for b in paginate(control, "list_configuration_bundles", "bundles")
+             if b["bundleName"] == bundle_name]
+    assert len(listed) == 1, f"ListConfigurationBundles found {listed!r} for {bundle_name!r}"
+    assert out["BundleRef"] == listed[0]["bundleArn"], (
+        f"Ref {out['BundleRef']!r} != ListConfigurationBundles arn {listed[0]['bundleArn']!r}"
+    )
+    assert out["BundleId"] == listed[0]["bundleId"], (
+        f"GetAtt BundleId {out['BundleId']!r} != ListConfigurationBundles id {listed[0]['bundleId']!r}"
+    )
+
+    bundle = control.get_configuration_bundle(bundleId=out["BundleId"])
+    assert out["BundleArn"] == bundle["bundleArn"] == listed[0]["bundleArn"], (
+        f"GetAtt BundleArn {out['BundleArn']!r} != GetConfigurationBundle {bundle['bundleArn']!r}"
+    )
+    assert out["VersionId"] == bundle["versionId"], (
+        f"GetAtt VersionId {out['VersionId']!r} != GetConfigurationBundle {bundle['versionId']!r}"
+    )
+    assert bundle["bundleName"] == bundle_name, f"bundleName {bundle['bundleName']!r}"
+    # The stored component configuration round-trips as a map of stringified values.
+    want_components = {"sim2real_component": {"configuration": {"enabled": "true", "threshold": "7"}}}
+    assert bundle["components"] == want_components, f"components {bundle['components']!r}"
+
+    bundle_tags = control.list_tags_for_resource(resourceArn=bundle["bundleArn"]).get("tags", {})
+    assert bundle_tags == {"sim2real": stack, "sim2real-bundle": bundle_name}, (
+        f"bundle tags {bundle_tags!r}"
+    )
+
+    delete_stack(cf, stack_id)
+    expect_error(lambda: control.get_configuration_bundle(bundleId=out["BundleId"]), *_NOT_FOUND)
+
+
+if __name__ == "__main__":
+    from fidelity_tests_runner import main
+
+    main(run)

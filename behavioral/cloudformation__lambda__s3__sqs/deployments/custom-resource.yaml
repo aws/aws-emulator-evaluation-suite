@@ -1,0 +1,76 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation Custom Resource backed by Lambda
+
+Parameters:
+  EchoValue:
+    Type: String
+
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'sim2real-xsvc-cr-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BasicExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  CfnResponseLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'sim2real-xsvc-cr-fn-${AWS::StackName}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 30
+      Code:
+        # !Sub bakes this stack's EchoValue into the function's own source, so the value only
+        # comes back if the Lambda really ran and really answered CloudFormation.
+        ZipFile: !Sub |
+          import json, urllib.request
+          def lambda_handler(event, context):
+              response_url = event['ResponseURL']
+              response_body = {
+                  'Status': 'SUCCESS',
+                  'Reason': 'OK',
+                  'PhysicalResourceId': event.get('PhysicalResourceId', 'custom-resource-id'),
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': {'Result': 'CustomResourceSuccess', 'Echo': '${EchoValue}'}
+              }
+              body = json.dumps(response_body).encode()
+              req = urllib.request.Request(
+                  url=response_url,
+                  data=body,
+                  method='PUT',
+                  headers={'Content-Type': '', 'Content-Length': len(body)}
+              )
+              urllib.request.urlopen(req)
+              return response_body
+
+  CustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt CfnResponseLambda.Arn
+
+Outputs:
+  CustomResourceResult:
+    Value: !GetAtt CustomResource.Result
+  CustomResourceEcho:
+    Value: !GetAtt CustomResource.Echo

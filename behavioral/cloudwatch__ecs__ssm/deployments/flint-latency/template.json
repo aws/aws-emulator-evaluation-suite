@@ -1,0 +1,454 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "sim2real carve of the api-and-observability latency-alarm estate: a Fargate publisher whose dependency latency is driven by an SSM flag, the p90 end-to-end latency alarm over it, and the backfill Lambda.",
+  "Parameters": {
+    "Token": {
+      "Type": "String",
+      "Description": "minted prefix for every physical name"
+    },
+    "VpcId": {
+      "Type": "AWS::EC2::VPC::Id"
+    },
+    "SubnetIds": {
+      "Type": "List<AWS::EC2::Subnet::Id>"
+    },
+    "FlintNamespace": {
+      "Type": "String"
+    },
+    "DependencyNamespace": {
+      "Type": "String"
+    },
+    "LatencyModeParamName": {
+      "Type": "String"
+    },
+    "PublishDepMetricsParamName": {
+      "Type": "String"
+    },
+    "AlarmPeriod": {
+      "Type": "Number",
+      "Default": 30
+    },
+    "Image": {
+      "Type": "String",
+      "Default": "public.ecr.aws/aws-cli/aws-cli:latest"
+    }
+  },
+  "Resources": {
+    "TaskLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "DeletionPolicy": "Delete",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "${Token}-flint-motion-detection"
+        },
+        "RetentionInDays": 120
+      }
+    },
+    "Cluster": {
+      "Type": "AWS::ECS::Cluster",
+      "Properties": {
+        "ClusterName": {
+          "Fn::Sub": "${Token}-cluster"
+        },
+        "ClusterSettings": [
+          {
+            "Name": "containerInsights",
+            "Value": "enabled"
+          }
+        ]
+      }
+    },
+    "TaskExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+          }
+        ]
+      }
+    },
+    "LatencyModeParam": {
+      "Type": "AWS::SSM::Parameter",
+      "Properties": {
+        "Name": {
+          "Ref": "LatencyModeParamName"
+        },
+        "Type": "String",
+        "Value": "healthy",
+        "Description": "Controls simulated dependency latency mode for the motion detection task"
+      }
+    },
+    "PublishDepMetricsParam": {
+      "Type": "AWS::SSM::Parameter",
+      "Properties": {
+        "Name": {
+          "Ref": "PublishDepMetricsParamName"
+        },
+        "Type": "String",
+        "Value": "true",
+        "Description": "Controls whether dependency latency metrics are published"
+      }
+    },
+    "TaskRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "publish-and-read-flags",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "cloudwatch:PutMetricData"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "xray:PutTraceSegments",
+                    "xray:PutTelemetryRecords"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ssm:GetParameter"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${LatencyModeParamName}"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PublishDepMetricsParamName}"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "TaskDefinition": {
+      "Type": "AWS::ECS::TaskDefinition",
+      "Properties": {
+        "Family": {
+          "Fn::Sub": "${Token}-flint-motion-detection-task"
+        },
+        "Cpu": "256",
+        "Memory": "512",
+        "NetworkMode": "awsvpc",
+        "RequiresCompatibilities": [
+          "FARGATE"
+        ],
+        "ExecutionRoleArn": {
+          "Fn::GetAtt": [
+            "TaskExecutionRole",
+            "Arn"
+          ]
+        },
+        "TaskRoleArn": {
+          "Fn::GetAtt": [
+            "TaskRole",
+            "Arn"
+          ]
+        },
+        "ContainerDefinitions": [
+          {
+            "Name": "HLSProcess",
+            "Image": {
+              "Ref": "Image"
+            },
+            "Cpu": 256,
+            "Memory": 512,
+            "Essential": true,
+            "EntryPoint": [
+              "bash",
+              "-c"
+            ],
+            "Command": [
+              "set -u\n# Flint motion-detection stand-in: one frame per loop. Reads the two flags from SSM on every frame,\n# publishes the per-component Time metrics and, when enabled, the dependency latency. The\n# end-to-end lag is internal pipeline time plus the dependency call, as the upstream task computes it.\ndim() { printf '[{\"Name\":\"Camera_name\",\"Value\":\"ALL\"},{\"Name\":\"Operation\",\"Value\":\"%s\"}]' \"$1\"; }\ndatum() { printf '{\"MetricName\":\"%s\",\"Dimensions\":%s,\"Value\":%s,\"Unit\":\"%s\",\"Timestamp\":\"%s\",\"StorageResolution\":1}' \"$1\" \"$(dim \"$2\")\" \"$3\" \"$4\" \"$TS\"; }\necho \"Starting Flint Motion Detection Service stage=$STAGE cluster=$CLUSTER_NAME\"\nwhile true; do\n  MODE=$(aws ssm get-parameter --name \"$QUARTZ_LATENCY_MODE_PARAM\" --query Parameter.Value --output text 2>/dev/null) || MODE=degraded\n  PUB=$(aws ssm get-parameter --name \"$PUBLISH_DEP_METRICS_PARAM\" --query Parameter.Value --output text 2>/dev/null) || PUB=true\n  PF=$((450 + RANDOM % 500)); HLS=$((1000 + RANDOM % 70)); CPU=$((47 + RANDOM % 3))\n  if [ \"$MODE\" = degraded ]; then Q=$((18000 + RANDOM % 2000)); else Q=$((2000 + RANDOM % 2500)); fi\n  INT=\"$((PF + HLS + 1)).6\"; FQL=\"$((PF + HLS + 1 + Q)).6\"\n  # One timestamp per frame, shared by both namespaces, so a frame's three series land in one bucket.\n  TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n  aws cloudwatch put-metric-data --namespace \"$FLINT_NAMESPACE\" --metric-data \"[$(datum Time ProcessFrame $PF Milliseconds),$(datum Time MotionDetection 1.6 Milliseconds),$(datum Time HLSStartLag $HLS Milliseconds),$(datum Time InternalPipelineTime $INT Milliseconds),$(datum Time FrameQuartzLag $FQL Milliseconds),$(datum NonIdlePct CPU $CPU Percent)]\" || echo \"put-metric-data failed\"\n  if [ \"$PUB\" = true ]; then\n    aws cloudwatch put-metric-data --namespace \"$DEPENDENCY_NAMESPACE\" --metric-data \"[{\\\"MetricName\\\":\\\"APILatency\\\",\\\"Dimensions\\\":[{\\\"Name\\\":\\\"Service\\\",\\\"Value\\\":\\\"Quartz\\\"},{\\\"Name\\\":\\\"Operation\\\",\\\"Value\\\":\\\"ReportPerson\\\"}],\\\"Value\\\":$Q,\\\"Unit\\\":\\\"Milliseconds\\\",\\\"Timestamp\\\":\\\"$TS\\\",\\\"StorageResolution\\\":1}]\" || echo \"dependency put failed\"\n  fi\n  echo \"quartz_api_call: operation=ReportPerson latency=${Q}ms mode=$MODE status=200\"\n  sleep 1\ndone\n"
+            ],
+            "Environment": [
+              {
+                "Name": "AWS_DEFAULT_REGION",
+                "Value": {
+                  "Ref": "AWS::Region"
+                }
+              },
+              {
+                "Name": "CLUSTER_NAME",
+                "Value": "Basalt"
+              },
+              {
+                "Name": "STAGE",
+                "Value": "prod"
+              },
+              {
+                "Name": "FLINT_NAMESPACE",
+                "Value": {
+                  "Ref": "FlintNamespace"
+                }
+              },
+              {
+                "Name": "DEPENDENCY_NAMESPACE",
+                "Value": {
+                  "Ref": "DependencyNamespace"
+                }
+              },
+              {
+                "Name": "QUARTZ_LATENCY_MODE_PARAM",
+                "Value": {
+                  "Ref": "LatencyModeParamName"
+                }
+              },
+              {
+                "Name": "PUBLISH_DEP_METRICS_PARAM",
+                "Value": {
+                  "Ref": "PublishDepMetricsParamName"
+                }
+              }
+            ],
+            "LogConfiguration": {
+              "LogDriver": "awslogs",
+              "Options": {
+                "awslogs-group": {
+                  "Ref": "TaskLogGroup"
+                },
+                "awslogs-region": {
+                  "Ref": "AWS::Region"
+                },
+                "awslogs-stream-prefix": "HLSProcess/container"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "FargateSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "sim2real Flint motion detection Fargate tasks",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "-1",
+            "CidrIp": "0.0.0.0/0"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "sim2real",
+            "Value": "api-and-observability"
+          },
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${Token}-sg"
+            }
+          }
+        ]
+      }
+    },
+    "Service": {
+      "Type": "AWS::ECS::Service",
+      "Properties": {
+        "ServiceName": {
+          "Fn::Sub": "${Token}-svc"
+        },
+        "Cluster": {
+          "Ref": "Cluster"
+        },
+        "TaskDefinition": {
+          "Ref": "TaskDefinition"
+        },
+        "DesiredCount": 1,
+        "LaunchType": "FARGATE",
+        "PlatformVersion": "LATEST",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "AssignPublicIp": "ENABLED",
+            "SecurityGroups": [
+              {
+                "Ref": "FargateSecurityGroup"
+              }
+            ],
+            "Subnets": {
+              "Ref": "SubnetIds"
+            }
+          }
+        }
+      }
+    },
+    "BackfillLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "DeletionPolicy": "Delete",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${Token}-quartz-backfill"
+        },
+        "RetentionInDays": 120
+      }
+    },
+    "BackfillRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+          }
+        ]
+      }
+    },
+    "BackfillFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": [
+        "BackfillLogGroup"
+      ],
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${Token}-quartz-backfill"
+        },
+        "Runtime": "python3.11",
+        "Handler": "index.lambda_handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "BackfillRole",
+            "Arn"
+          ]
+        },
+        "MemorySize": 1280,
+        "Timeout": 300,
+        "Environment": {
+          "Variables": {
+            "STAGE": "prod",
+            "CLUSTER": "Basalt"
+          }
+        },
+        "Code": {
+          "ZipFile": "import json\nimport logging\nimport time\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\ndef lambda_handler(event, context):\n    logger.info(f\"lambda_handler -- event: {json.dumps(event)}\")\n    start_time = int(time.time())\n    time.sleep(5)\n    end_time = int(time.time())\n    logger.info(f\"start: {start_time}, end: {end_time}, duration: {end_time - start_time}\")\n    return {\"statusCode\": 200,\n            \"body\": json.dumps({\"message\": \"DLQ check completed\", \"messagesProcessed\": 0,\n                                \"duration\": end_time - start_time})}\n"
+        }
+      }
+    },
+    "ServiceLatencyAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": {
+          "Fn::Sub": "${Token}-service-latency"
+        },
+        "AlarmDescription": "P90 time, in milliseconds, from initial frame processing to reporting an object to the dependency",
+        "Namespace": {
+          "Ref": "FlintNamespace"
+        },
+        "MetricName": "Time",
+        "Dimensions": [
+          {
+            "Name": "Camera_name",
+            "Value": "ALL"
+          },
+          {
+            "Name": "Operation",
+            "Value": "FrameQuartzLag"
+          }
+        ],
+        "ExtendedStatistic": "p90",
+        "Period": {
+          "Ref": "AlarmPeriod"
+        },
+        "Unit": "Milliseconds",
+        "EvaluationPeriods": 3,
+        "Threshold": 15000,
+        "ComparisonOperator": "GreaterThanThreshold",
+        "TreatMissingData": "notBreaching"
+      }
+    }
+  },
+  "Outputs": {
+    "ClusterName": {
+      "Value": {
+        "Ref": "Cluster"
+      }
+    },
+    "ServiceName": {
+      "Value": {
+        "Fn::GetAtt": [
+          "Service",
+          "Name"
+        ]
+      }
+    },
+    "TaskLogGroupName": {
+      "Value": {
+        "Ref": "TaskLogGroup"
+      }
+    },
+    "TaskDefinitionArn": {
+      "Value": {
+        "Ref": "TaskDefinition"
+      }
+    },
+    "QuartzLatencyModeParamName": {
+      "Value": {
+        "Ref": "LatencyModeParam"
+      }
+    },
+    "PublishDepMetricsParamName": {
+      "Value": {
+        "Ref": "PublishDepMetricsParam"
+      }
+    },
+    "QuartzBackfillFunctionName": {
+      "Value": {
+        "Ref": "BackfillFunction"
+      }
+    },
+    "ServiceLatencyAlarmName": {
+      "Value": {
+        "Ref": "ServiceLatencyAlarm"
+      }
+    }
+  }
+}

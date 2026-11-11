@@ -1,0 +1,23 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Consumer of the sim2real macro. It declares NO SSM parameter of its own: the only
+  way ssm:GetParameter can find one after this stack deploys is for CloudFormation to
+  have resolved the macro registry entry, invoked the customer Lambda over this
+  fragment, and deployed what came back. The SIM2REAL_* placeholders are substituted
+  by the check before submission.
+
+Transform:
+  - Name: SIM2REAL_MACRO_NAME
+    Parameters:
+      ParameterName: SIM2REAL_PARAM_NAME
+      ParameterValue: SIM2REAL_PARAM_VALUE
+
+Resources:
+  # A free, service-independent anchor so the fragment has a Resources section of its
+  # own; its Output must survive the expansion.
+  Anchor:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+Outputs:
+  AnchorRef:
+    Value: !Ref Anchor

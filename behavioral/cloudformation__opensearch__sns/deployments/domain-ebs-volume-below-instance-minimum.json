@@ -1,0 +1,27 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "sim2real-xsvc deploy-rollback: an SNS topic, then (DependsOn) an OpenSearch 2.x domain whose gp3 EBS volume is 5 GiB, below the instance type's minimum. CreateDomain rejects it after the topic exists, so the stack must roll the topic back.",
+  "Parameters": {
+    "TopicName": {"Type": "String"},
+    "DomainName": {"Type": "String"}
+  },
+  "Resources": {
+    "Topic": {
+      "Type": "AWS::SNS::Topic",
+      "Properties": {"TopicName": {"Ref": "TopicName"}}
+    },
+    "Domain": {
+      "Type": "AWS::OpenSearchService::Domain",
+      "DependsOn": "Topic",
+      "Properties": {
+        "DomainName": {"Ref": "DomainName"},
+        "EngineVersion": "OpenSearch_2.19",
+        "ClusterConfig": {"InstanceType": "t3.small.search", "InstanceCount": 1},
+        "EBSOptions": {"EBSEnabled": true, "VolumeType": "gp3", "VolumeSize": 5}
+      }
+    }
+  },
+  "Outputs": {
+    "TopicArn": {"Value": {"Ref": "Topic"}}
+  }
+}

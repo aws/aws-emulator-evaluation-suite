@@ -1,0 +1,63 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  GoodFunctionName:
+    Type: String
+  BadFunctionName:
+    Type: String
+Resources:
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: test
+      EndpointConfiguration:
+        Type: REGIONAL
+      Auth:
+        DefaultAuthorizer: AWS_IAM
+        InvokeRole: NONE
+  GoodFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref GoodFunctionName
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 10
+      InlineCode: |
+        import json
+
+
+        def handler(event, context):
+            return {
+                "statusCode": 200,
+                "headers": {"X-Sim2real-Marker": "good"},
+                "body": json.dumps({
+                    "path": event.get("path"),
+                    "httpMethod": event.get("httpMethod"),
+                    "queryStringParameters": event.get("queryStringParameters"),
+                    "resource": event.get("resource"),
+                }),
+            }
+      Events:
+        Proxy:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /good/{proxy+}
+            Method: ANY
+  BadFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref BadFunctionName
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 10
+      InlineCode: |
+        def handler(event, context):
+            return {"message": "not a proxy-format response"}
+      Events:
+        Proxy:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /bad/{proxy+}
+            Method: ANY

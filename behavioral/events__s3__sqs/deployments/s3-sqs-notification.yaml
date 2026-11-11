@@ -1,0 +1,56 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  S3 bucket that pushes ObjectCreated notifications directly to an SQS queue.
+  Exercises the s3->sqs "notification" integration edge end-to-end via CloudFormation.
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: >
+      Explicit bucket name. Required to break the circular dependency between
+      SourceBucket (which needs the queue to exist and be authorized before its
+      NotificationConfiguration is applied) and NotifyQueuePolicy (which needs
+      the bucket ARN for its aws:SourceArn condition). Naming the bucket lets
+      the policy build the ARN with !Sub instead of !GetAtt.
+
+Resources:
+  NotifyQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 300
+
+  NotifyQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref NotifyQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowS3SendMessage
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt NotifyQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:s3:::${BucketName}"
+
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: NotifyQueuePolicy
+    Properties:
+      BucketName: !Ref BucketName
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt NotifyQueue.Arn
+
+Outputs:
+  BucketName:
+    Value: !Ref SourceBucket
+  QueueUrl:
+    Value: !Ref NotifyQueue
+  QueueArn:
+    Value: !GetAtt NotifyQueue.Arn

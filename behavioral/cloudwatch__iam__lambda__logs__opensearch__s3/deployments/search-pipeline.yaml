@@ -1,0 +1,210 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  S3 -> Lambda -> OpenSearch indexing pipeline with a scoped IAM role, plus the log group, metric
+  filter and alarm that make the indexing observable.
+
+# The role is the subject of the failure-injection variant: es:ESHttpPut / ESHttpPost are what let the
+# indexer write a document, and the domain's own access policy delegates the decision here. Everything
+# else in that variant is identical.
+#
+# The Lambda permission's SourceArn is BUILT FROM THE BUCKET NAME PARAMETER rather than from
+# !GetAtt Bucket.Arn, because the bucket's NotificationConfiguration points at the function and the
+# GetAtt form would close a dependency cycle. The bucket DependsOn the permission so the notification
+# is never configured before S3 is allowed to invoke.
+
+Parameters:
+  BucketName:
+    Type: String
+  FunctionName:
+    Type: String
+  DomainEndpoint:
+    Type: String
+  DomainArn:
+    Type: String
+  IndexName:
+    Type: String
+  MetricNamespace:
+    Type: String
+  MetricName:
+    Type: String
+
+Resources:
+  IndexerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${FunctionName}'
+      RetentionInDays: 7
+
+  IndexedDocuments:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref IndexerLogGroup
+      FilterPattern: '{ $.event = "document.indexed" }'
+      MetricTransformations:
+        - MetricNamespace: !Ref MetricNamespace
+          MetricName: !Ref MetricName
+          MetricValue: '1'
+          DefaultValue: 0
+
+  IndexedDocumentsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: !Ref MetricNamespace
+      MetricName: !Ref MetricName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      ActionsEnabled: false
+
+  IndexerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: indexer
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${BucketName}/*'
+              - Effect: Allow
+                Action:
+                  - es:ESHttpPut
+                  - es:ESHttpPost
+                  - es:ESHttpGet
+                Resource: !Sub '${DomainArn}/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${FunctionName}:*'
+
+  IndexerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - IndexerLogGroup
+    Properties:
+      FunctionName: !Ref FunctionName
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt IndexerRole.Arn
+      Environment:
+        Variables:
+          OS_ENDPOINT: !Ref DomainEndpoint
+          OS_INDEX: !Ref IndexName
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          import boto3
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+
+          REGION = os.environ['AWS_REGION']
+          ENDPOINT = os.environ['OS_ENDPOINT']
+          s3 = boto3.client('s3')
+
+
+          def _signed(method, path, body=None):
+              creds = boto3.Session().get_credentials().get_frozen_credentials()
+              url = 'https://' + ENDPOINT + path
+              data = json.dumps(body).encode('utf-8') if body is not None else None
+              headers = {'Content-Type': 'application/json'} if data is not None else {}
+              req = AWSRequest(method=method, url=url, data=data, headers=headers)
+              SigV4Auth(creds, 'es', REGION).add_auth(req)
+              http = urllib.request.Request(
+                  url, data=req.body, headers=dict(req.headers), method=method
+              )
+              try:
+                  with urllib.request.urlopen(http, timeout=25) as resp:
+                      return resp.status, resp.read().decode('utf-8', 'replace')
+              except urllib.error.HTTPError as exc:
+                  return exc.code, exc.read().decode('utf-8', 'replace')
+
+
+          def handler(event, context):
+              index = os.environ['OS_INDEX']
+              results = []
+              for record in event.get('Records', []):
+                  bucket = record['s3']['bucket']['name']
+                  key = urllib.parse.unquote_plus(record['s3']['object']['key'])
+                  obj = s3.get_object(Bucket=bucket, Key=key)
+                  payload = json.loads(obj['Body'].read())
+                  doc_id = urllib.parse.quote(key, safe='')
+                  status, text = _signed(
+                      'PUT',
+                      '/' + index + '/_doc/' + doc_id + '?refresh=true',
+                      {
+                          'key': key,
+                          'bucket': bucket,
+                          'title': payload.get('title', ''),
+                          'body': payload.get('body', ''),
+                          'size': obj['ContentLength'],
+                      },
+                  )
+                  results.append({'key': key, 'status': status})
+                  print(json.dumps({
+                      'event': 'document.indexed' if status < 300 else 'document.rejected',
+                      'index': index,
+                      'key': key,
+                      'status': status,
+                      'detail': text[:400],
+                      'requestId': context.aws_request_id,
+                  }))
+              return {'results': results}
+
+  IndexerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt IndexerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Sub 'arn:${AWS::Partition}:s3:::${BucketName}'
+
+  DocumentBucket:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - IndexerPermission
+    Properties:
+      BucketName: !Ref BucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .json
+            Function: !GetAtt IndexerFunction.Arn
+
+Outputs:
+  BucketNameOut:
+    Value: !Ref DocumentBucket
+  IndexerFunctionName:
+    Value: !Ref IndexerFunction
+  IndexerRoleArn:
+    Value: !GetAtt IndexerRole.Arn
+  LogGroupName:
+    Value: !Ref IndexerLogGroup
+  AlarmName:
+    Value: !Ref IndexedDocumentsAlarm
+  IndexNameOut:
+    Value: !Ref IndexName

@@ -1,0 +1,268 @@
+"""create-duplicate-name-resource-in-use."""
+from __future__ import annotations
+
+import json
+import time
+from botocore.exceptions import ClientError
+
+from behavioral_harness import tags
+
+CHECK = "create-duplicate-name-resource-in-use"
+GROUP = 'overly-permissive'
+SERVICES = ['firehose']
+
+TRUST_POLICY = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {"Service": "firehose.amazonaws.com"},
+            "Action": "sts:AssumeRole",
+        }
+    ],
+}
+
+ACCESS_POLICY = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:AbortMultipartUpload",
+                "s3:GetBucketLocation",
+                "s3:GetObject",
+                "s3:ListBucket",
+                "s3:ListBucketMultipartUploads",
+                "s3:PutObject",
+                "kms:Decrypt",
+                "kms:GenerateDataKey",
+                "logs:PutLogEvents",
+            ],
+            "Resource": "*",
+        }
+    ],
+}
+
+def _err(fn):
+    """Call fn() and return (Code, Message) of the ClientError it raised; an unexpected success raises."""
+    try:
+        result = fn()
+    except ClientError as exc:
+        err = exc.response.get("Error", {})
+        return err.get("Code"), err.get("Message")
+    raise AssertionError(f"expected this call to be rejected, but it SUCCEEDED and returned {result!r}")
+
+def _poll_until(probe, predicate, *, timeout_s=60, interval_s=1.0, description="condition"):
+    """Poll probe() until predicate(result) is truthy; return the final result."""
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while time.monotonic() < deadline:
+        last = probe()
+        if predicate(last):
+            return last
+        time.sleep(interval_s)
+    raise AssertionError(f"{description} not met within {timeout_s}s. Last result: {last!r}")
+
+def _status_or_gone(ctx, name):
+    """DeliveryStreamStatus, or "GONE" once DescribeDeliveryStream answers not-found."""
+    try:
+        return _describe(ctx, name)["DeliveryStreamStatus"]
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
+            return "GONE"
+        raise
+
+def _bucket_arn(bucket_name):
+    return f"arn:aws:s3:::{bucket_name}"
+
+def _describe(ctx, name):
+    return ctx.client("firehose").describe_delivery_stream(DeliveryStreamName=name)[
+        "DeliveryStreamDescription"
+    ]
+
+def _delivery_role_arn(ctx):
+    """Create a real IAM role Firehose can assume (validated at CreateDeliveryStream
+    time, so a fabricated ARN is not usable); register its teardown."""
+    iam = ctx.client("iam")
+    name = ctx.unique_name("sim2real-behav-fh-role-")
+    resp = iam.create_role(
+        RoleName=name,
+        AssumeRolePolicyDocument=json.dumps(TRUST_POLICY),
+        Description="SimParityProbe behavioral fixture role",
+        Tags=[{"Key": "sim2real-check", "Value": CHECK}],
+    )
+    iam.put_role_policy(
+        RoleName=name,
+        PolicyName="firehose-destination-access",
+        PolicyDocument=json.dumps(ACCESS_POLICY),
+    )
+
+    def _teardown():
+        try:
+            for pn in iam.list_role_policies(RoleName=name).get("PolicyNames", []):
+                try:
+                    iam.delete_role_policy(RoleName=name, PolicyName=pn)
+                except ClientError as exc:
+                    if exc.response["Error"]["Code"] != "NoSuchEntity":
+                        raise
+            iam.delete_role(RoleName=name)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "NoSuchEntity":
+                raise
+
+    ctx.on_cleanup(_teardown)
+    return resp["Role"]["Arn"]
+
+def _make_bucket(ctx):
+    """Create an S3 destination bucket and register its (empty-then-delete) teardown."""
+    s3 = ctx.client("s3")
+    name = ctx.unique_name("sim2real-behav-firehose-dst-")
+    kwargs = {"Bucket": name}
+    # us-east-1 is the sole region where CreateBucket rejects an explicit LocationConstraint.
+    if ctx.region and ctx.region != "us-east-1":
+        kwargs["CreateBucketConfiguration"] = {"LocationConstraint": ctx.region}
+    s3.create_bucket(**kwargs)
+    s3.put_bucket_tagging(
+        Bucket=name, Tagging={"TagSet": [{"Key": "sim2real-check", "Value": CHECK}]}
+    )
+
+    def _teardown():
+        try:
+            paginator = s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=name):
+                for obj in page.get("Contents", []):
+                    s3.delete_object(Bucket=name, Key=obj["Key"])
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] not in ("NoSuchBucket", "NoSuchKey"):
+                raise
+        try:
+            s3.delete_bucket(Bucket=name)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "NoSuchBucket":
+                raise
+
+    ctx.on_cleanup(_teardown)
+    return name
+
+def _default_s3_config(ctx, bucket_name):
+    return {
+        "RoleARN": _delivery_role_arn(ctx),
+        "BucketARN": _bucket_arn(bucket_name),
+        "BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 60},
+    }
+
+def _delete_stream(ctx, name, force=True):
+    try:
+        ctx.client("firehose").delete_delivery_stream(
+            DeliveryStreamName=name, AllowForceDelete=force
+        )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ResourceNotFoundException":
+            raise
+
+def _create_stream(ctx, name, bucket_name=None, **extra):
+    """Create a delivery stream with a minimal ExtendedS3 destination unless the
+    caller supplies their own destination kwargs. Retries while the IAM role is
+    still propagating (Firehose rejects a brand-new role until it is visible)."""
+    fh = ctx.client("firehose")
+    if bucket_name is None and not any(
+        k.endswith("DestinationConfiguration") for k in extra
+    ):
+        bucket_name = _make_bucket(ctx)
+    kwargs = {"DeliveryStreamName": name}
+    if bucket_name is not None:
+        kwargs["ExtendedS3DestinationConfiguration"] = _default_s3_config(ctx, bucket_name)
+    kwargs.setdefault("Tags", [{"Key": "sim2real-check", "Value": CHECK}])
+    kwargs.update(extra)
+
+    deadline = time.monotonic() + 60
+    while True:
+        try:
+            resp = fh.create_delivery_stream(**kwargs)
+            break
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code")
+            msg = (exc.response.get("Error", {}).get("Message") or "").lower()
+            propagating = code == "InvalidArgumentException" and (
+                "assume" in msg or "not authorized" in msg or "does not exist" in msg
+            )
+            if propagating and time.monotonic() < deadline:
+                time.sleep(5)
+                continue
+            raise
+    ctx.on_cleanup(lambda: _delete_stream(ctx, name))
+    return resp
+
+def _wait_active(ctx, name, timeout_s=100, interval_s=3):
+    return _poll_until(
+        lambda: _describe(ctx, name),
+        lambda d: d["DeliveryStreamStatus"] == "ACTIVE",
+        timeout_s=timeout_s,
+        interval_s=interval_s,
+    )
+
+def _shared_stream(ctx):
+    """An ACTIVE DirectPut -> ExtendedS3 stream (self-contained: created per check)."""
+    name = ctx.unique_name("sim2real-behav-fh-shared-")
+    _create_stream(ctx, name)
+    _wait_active(ctx, name, timeout_s=100, interval_s=3)
+    return name
+
+def _shared_bucket(ctx):
+    return _make_bucket(ctx)
+
+@tags("axis:rejection", "cap:c1", "concern:negative-classes", "plane:control")
+def run(ctx) -> None:
+    """CreateDeliveryStream with a name already in use is rejected with ResourceInUseException and the
+    existing stream stays ACTIVE; once that stream is deleted, the identical call succeeds."""
+    name = _shared_stream(ctx)
+    s3_cfg = _default_s3_config(ctx, _shared_bucket(ctx))
+    code, message = _err(
+        lambda: ctx.client("firehose").create_delivery_stream(
+            DeliveryStreamName=name,
+            ExtendedS3DestinationConfiguration=s3_cfg,
+        )
+    )
+    assert code == "ResourceInUseException", f"expected ResourceInUseException, got {code}"
+    expected = f"Firehose {name} under accountId {ctx.account} already exists"
+    assert message == expected, f"expected message {expected!r}, got {message!r}"
+    status = _describe(ctx, name)["DeliveryStreamStatus"]
+    assert status == "ACTIVE", f"expected the pre-existing stream to remain ACTIVE, got {status}"
+
+    # Restore: remove the name-holding stream, then the identical call must succeed.
+    ctx.client("firehose").delete_delivery_stream(DeliveryStreamName=name, AllowForceDelete=True)
+    _poll_until(
+        lambda: _status_or_gone(ctx, name),
+        lambda status: status == "GONE",
+        timeout_s=120,
+        interval_s=3,
+        description="pre-existing stream fully deleted",
+    )
+
+    deadline = time.monotonic() + 60
+    while True:
+        try:
+            resp = ctx.client("firehose").create_delivery_stream(
+                DeliveryStreamName=name,
+                ExtendedS3DestinationConfiguration=s3_cfg,
+            )
+            break
+        except ClientError as exc:
+            # The name may still be tearing down just after ResourceNotFoundException.
+            if exc.response.get("Error", {}).get("Code") == "ResourceInUseException" and (
+                time.monotonic() < deadline
+            ):
+                time.sleep(3)
+                continue
+            raise
+    assert resp.get("DeliveryStreamARN"), "identical call must succeed once the name is free"
+    ctx.on_cleanup(lambda: _delete_stream(ctx, name))
+    restored = _wait_active(ctx, name)
+    assert restored["DeliveryStreamStatus"] == "ACTIVE", (
+        f"expected the restored stream to become ACTIVE, got {restored['DeliveryStreamStatus']}"
+    )
+
+
+if __name__ == "__main__":
+    from fidelity_tests_runner import main
+    main(run)

@@ -1,0 +1,17 @@
+# The fidelity tests (behavioral/) are generated and published as-is: no hook rewrites them.
+# Every hook repository is pinned to a full commit SHA; the comment names its release.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: 25bcf95026b96e2dd3c0aec3090c3d6ef6ca2e6c # frozen: v0.17.3
+    hooks:
+      - id: ruff-check
+        exclude: ^behavioral/
+      - id: ruff-format
+        exclude: ^behavioral/
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: cef0300fd0fc4d2a87a85fa2093c6b283ea36f4b # frozen: v5.0.0
+    hooks:
+      - id: check-json
+      # --unsafe checks syntax only, so CloudFormation tags (!Ref, !GetAtt) parse.
+      - id: check-yaml
+        args: [--unsafe]

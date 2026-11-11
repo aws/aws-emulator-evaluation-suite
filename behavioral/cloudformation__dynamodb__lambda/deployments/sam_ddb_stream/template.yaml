@@ -1,0 +1,64 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  FunctionName:
+    Type: String
+  MarkerPrefix:
+    Type: String
+Resources:
+  Table:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+  Fn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 10
+      Environment:
+        Variables:
+          MARKER_PREFIX: !Ref MarkerPrefix
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: ssm:PutParameter
+              Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${MarkerPrefix}*
+      InlineCode: |
+        import json
+        import os
+
+        import boto3
+
+        ssm = boto3.client("ssm")
+
+
+        def handler(event, context):
+            prefix = os.environ["MARKER_PREFIX"]
+            for record in event["Records"]:
+                image = record["dynamodb"].get("NewImage") or record["dynamodb"].get("OldImage")
+                pk = image["pk"]["S"] if image and "pk" in image else None
+                print(json.dumps({"sim2real_event": record["eventName"], "sim2real_pk": pk}))
+                if record["eventName"] == "INSERT":
+                    ssm.put_parameter(
+                        Name=f"{prefix}{pk}", Value="inserted", Type="String", Overwrite=True)
+      Events:
+        Stream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt Table.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 1
+            MaximumRetryAttempts: 1
+            FilterCriteria:
+              Filters:
+                - Pattern: '{"eventName": ["INSERT"]}'

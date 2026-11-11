@@ -1,0 +1,88 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: S3 -> Lambda -> DynamoDB notification pipeline for integration testing
+
+Resources:
+  OutputTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WriteToTable
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt OutputTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  NotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OutputTable
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          ddb = boto3.client("dynamodb")
+          def handler(event, context):
+              table = os.environ["TABLE_NAME"]
+              for record in event.get("Records", []):
+                  key = record["s3"]["object"]["key"]
+                  ddb.put_item(TableName=table, Item={"pk": {"S": key}, "processed": {"S": "true"}})
+              return {"ok": True}
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotificationFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${AWS::StackName}-bucket"
+      SourceAccount: !Ref AWS::AccountId
+
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: LambdaInvokePermission
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-bucket"
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt NotificationFunction.Arn
+
+Outputs:
+  BucketNameOut:
+    Value: !Ref SourceBucket
+  TableNameOut:
+    Value: !Ref OutputTable
+  FunctionNameOut:
+    Value: !Ref NotificationFunction

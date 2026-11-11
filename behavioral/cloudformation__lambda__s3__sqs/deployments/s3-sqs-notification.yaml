@@ -1,0 +1,39 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: S3 + SQS notification stack
+
+Resources:
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'sim2real-xsvc-s3notif-queue-${AWS::StackName}'
+
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref Queue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt Queue.Arn
+
+  Bucket:
+    Type: AWS::S3::Bucket
+    DependsOn: QueuePolicy
+    Properties:
+      BucketName: !Sub 'sim2real-xsvc-s3notif-bkt-${AWS::StackName}'
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Queue: !GetAtt Queue.Arn
+
+Outputs:
+  BucketName:
+    Value: !Ref Bucket
+  QueueUrl:
+    Value: !Ref Queue

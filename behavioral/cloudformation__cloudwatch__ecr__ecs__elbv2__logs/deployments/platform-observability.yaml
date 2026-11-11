@@ -1,0 +1,62 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Observability child: the log group the service child's awslogs driver writes to, a metric filter over
+  the container's structured startup line, and an alarm on the metric that filter produces.
+
+# The log group is created HERE and consumed by a SIBLING stack, so its name has to travel
+# child -> parent -> child through Outputs and Fn::GetAtt. It is also the resource the drift leg mutates
+# out of band, and the resource whose disappearance proves a parent rollback deleted the SUCCESSFUL
+# child as well as the failing one.
+
+Parameters:
+  LogGroupName:
+    Type: String
+  RetentionDays:
+    Type: Number
+    Default: 7
+  MetricNamespace:
+    Type: String
+  MetricName:
+    Type: String
+  AlarmName:
+    Type: String
+
+Resources:
+  PlatformLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref LogGroupName
+      RetentionInDays: !Ref RetentionDays
+
+  StartedFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref PlatformLogGroup
+      FilterPattern: '{ $.event = "service.started" }'
+      MetricTransformations:
+        - MetricNamespace: !Ref MetricNamespace
+          MetricName: !Ref MetricName
+          MetricValue: '1'
+          DefaultValue: 0
+
+  StartedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Ref AlarmName
+      Namespace: !Ref MetricNamespace
+      MetricName: !Ref MetricName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      ActionsEnabled: false
+
+Outputs:
+  LogGroupNameOut:
+    Value: !Ref PlatformLogGroup
+  AlarmNameOut:
+    Value: !Ref StartedAlarm
+  MetricNameOut:
+    Value: !Ref MetricName

@@ -1,0 +1,149 @@
+"""cfn-ssm-parameter-getatt-unknown-attribute-rejected-rolls-back."""
+from __future__ import annotations
+
+import json
+import time
+
+from botocore.exceptions import ClientError
+
+from behavioral_harness import tags
+
+CHECK = "cfn-ssm-parameter-getatt-unknown-attribute-rejected-rolls-back"
+GROUP = "deploy"
+SERVICES = ["cloudformation", "ssm"]
+
+_BAD_ATTRIBUTE = "NoSuchAttr"
+_REASON = f"Requested attribute {_BAD_ATTRIBUTE} does not exist in schema for AWS::SSM::Parameter"
+
+_STACK = "<stack>"
+_VALUE = "sim2real-cfnga-ssm-value"
+_STACK_TERMINAL = {"CREATE_COMPLETE", "CREATE_FAILED", "ROLLBACK_COMPLETE", "ROLLBACK_FAILED",
+                   "DELETE_COMPLETE", "DELETE_FAILED"}
+
+
+def _wait_stack(cfn, stack_id: str, *, timeout_s: float = 240.0, interval_s: float = 2.0) -> str:
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while time.monotonic() < deadline:
+        last = cfn.describe_stacks(StackName=stack_id)["Stacks"][0]["StackStatus"]
+        if last in _STACK_TERMINAL:
+            return last
+        time.sleep(interval_s)
+    raise AssertionError(f"stack {stack_id!r} not terminal within {timeout_s}s (last={last!r})")
+
+
+def _delete_stack_and_wait(cfn, stack_id: str) -> None:
+    cfn.delete_stack(StackName=stack_id)
+    status = _wait_stack(cfn, stack_id)
+    if status != "DELETE_COMPLETE":
+        raise AssertionError(f"stack {stack_id!r} delete ended {status!r}")
+
+
+def _rows(cfn, stack_id: str) -> list[tuple]:
+    """``(logical id, status, reason)`` of every stack event, oldest first; the stack is ``<stack>``."""
+    events = [e for page in cfn.get_paginator("describe_stack_events").paginate(StackName=stack_id)
+              for e in page["StackEvents"]]
+    return [(_STACK if e["LogicalResourceId"] == e["StackName"] else e["LogicalResourceId"],
+             e["ResourceStatus"], e.get("ResourceStatusReason")) for e in reversed(events)]
+
+
+def _in_order(rows: list[tuple], wanted: list[tuple]) -> bool:
+    """True when every ``(logical id, status)`` of ``wanted`` occurs in ``rows`` in that order."""
+    it = iter(r[:2] for r in rows)
+    return all(w in it for w in wanted)
+
+
+def _outputs(cfn, stack_id: str) -> dict:
+    return {o["OutputKey"]: o["OutputValue"]
+            for o in cfn.describe_stacks(StackName=stack_id)["Stacks"][0].get("Outputs", [])}
+
+
+def _error(fn) -> dict:
+    try:
+        result = fn()
+    except ClientError as exc:
+        return exc.response["Error"]
+    raise AssertionError(f"expected the call to be refused, but it succeeded: {result!r}")
+
+
+def _template(param_name: str, *, bad: bool) -> str:
+    outputs = {}
+    if bad:
+        outputs["Bad"] = {"Value": {"Fn::GetAtt": ["Param", _BAD_ATTRIBUTE]}}
+    else:
+        outputs["ParamArn"] = {"Value": {"Fn::GetAtt": ["Param", "Arn"]}}
+    return json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Param": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": param_name, "Type": "String", "Value": _VALUE,
+            }},
+        },
+        "Outputs": outputs,
+    })
+
+
+@tags("axis:rejection", "cap:c3", "concern:deploy", "concern:negative-classes", "plane:control")
+def run(ctx) -> None:
+    """A Fn::GetAtt naming an attribute AWS::SSM::Parameter lacks passes ValidateTemplate and
+    CreateStack, then fails the stack with the exact schema reason, rolls back and deletes the
+    parameter; the same template with only the declared Arn output deploys."""
+    cfn = ctx.client("cloudformation")
+    ssm = ctx.client("ssm")
+
+    good_param = ctx.unique_name("sim2real-behav-cfnga-ssm-ok-")
+    good = cfn.create_stack(
+        StackName=ctx.unique_name("sim2real-behav-cfnga-ssm-ok-stk-"),
+        TemplateBody=_template(good_param, bad=False),
+        Tags=[{"Key": "sim2real", "Value": CHECK}],
+    )["StackId"]
+    ctx.on_cleanup(lambda: _delete_stack_and_wait(cfn, good))
+
+    bad_param = ctx.unique_name("sim2real-behav-cfnga-ssm-bad-")
+    bad_template = _template(bad_param, bad=True)
+    validated = cfn.validate_template(TemplateBody=bad_template)
+    assert validated.get("Parameters") == [], (
+        f"ValidateTemplate accepts the template; it answered {validated!r}")
+
+    bad = cfn.create_stack(
+        StackName=ctx.unique_name("sim2real-behav-cfnga-ssm-bad-stk-"),
+        TemplateBody=bad_template,
+        Tags=[{"Key": "sim2real", "Value": CHECK}],
+    )["StackId"]
+    ctx.on_cleanup(lambda: _delete_stack_and_wait(cfn, bad))
+
+    status = _wait_stack(cfn, good)
+    assert status == "CREATE_COMPLETE", f"the control stack must deploy; got {status!r}"
+
+    status = _wait_stack(cfn, bad)
+    assert status == "ROLLBACK_COMPLETE", (
+        f"an unknown GetAtt attribute must fail the stack and roll it back; got {status!r}")
+
+    outputs = _outputs(cfn, good)
+    live = ssm.get_parameter(Name=good_param)["Parameter"]
+    assert (live["Type"], live["Value"]) == ("String", _VALUE), (
+        f"the control parameter reads back as {(live['Type'], live['Value'])!r}")
+    assert outputs.get("ParamArn") == live["ARN"], (
+        f"GetAtt Arn of the control parameter must equal SSM's ARN {live['ARN']!r}; got {outputs!r}")
+
+    # The output failure is reported only on the stack's own rollback event, so that row's
+    # reason is graded, together with the terminal rows that bracket it.
+    rows = _rows(cfn, bad)
+    reasons = [r[2] for r in rows if r[:2] == (_STACK, "ROLLBACK_IN_PROGRESS")]
+    assert reasons == [f"{_REASON}. Rollback requested by user."], (
+        f"the stack's rollback reason must name the unknown attribute; got {reasons!r}")
+    wanted = [("Param", "CREATE_COMPLETE"), (_STACK, "ROLLBACK_IN_PROGRESS"),
+              ("Param", "DELETE_COMPLETE"), (_STACK, "ROLLBACK_COMPLETE")]
+    assert _in_order(rows, wanted), (
+        f"the parameter must be built, then deleted by the rollback; expected {wanted!r} in "
+        f"order, got {[r[:2] for r in rows]!r}")
+
+    err = _error(lambda: ssm.get_parameter(Name=bad_param))
+    assert err["Code"] == "ParameterNotFound", (
+        f"the rolled-back parameter: got {err['Code']!r}, expected ParameterNotFound")
+    assert err["Message"] == "", f"expected the standard empty ParameterNotFound message, got {err['Message']!r}"
+
+
+if __name__ == "__main__":
+    from fidelity_tests_runner import main
+    main(run)

@@ -1,0 +1,78 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  The shape every CDK-synthesized stack has: an AWS::SSM::Parameter::Value<String>
+  BootstrapVersion parameter that CloudFormation must resolve by reading SSM, plus a
+  template-level Rules assertion evaluated against the RESOLVED value at submit time.
+  The resolved value is carried into a deployed Lambda's environment so the resolution
+  is observable through the provisioned resource, not only through stack metadata.
+
+Parameters:
+  BootstrapVersion:
+    Type: AWS::SSM::Parameter::Value<String>
+    Description: >-
+      Name of an SSM parameter holding the bootstrap version. CloudFormation
+      substitutes its VALUE wherever this parameter is Ref'd.
+
+Rules:
+  CheckBootstrapVersion:
+    Assertions:
+      - Assert:
+          Fn::Not:
+            - Fn::Contains:
+                - ['1', '2', '3', '4', '5']
+                - !Ref BootstrapVersion
+        AssertDescription: >-
+          bootstrap stack version 6 required. Please run 'cdk bootstrap' with a
+          recent version of the CDK CLI.
+
+Resources:
+  ReporterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BasicExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  ReporterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ReporterRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          # Ref of an SSM-typed parameter must be the SSM VALUE, not the name.
+          BOOTSTRAP_VERSION: !Ref BootstrapVersion
+      Code:
+        ZipFile: |
+          import os
+
+          def handler(event, context):
+              return {"bootstrap_version": os.environ["BOOTSTRAP_VERSION"]}
+      Tags:
+        - Key: sim2real:managed
+          Value: 'true'
+        - Key: sim2real:prefix
+          Value: sim2real-xsvc
+
+Outputs:
+  ResolvedBootstrapVersion:
+    Value: !Ref BootstrapVersion
+  ReporterFunctionName:
+    Value: !Ref ReporterFunction

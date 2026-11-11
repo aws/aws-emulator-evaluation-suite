@@ -1,0 +1,53 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  An SSM parameter whose value is a stack parameter, plus a conditional SQS queue that
+  cannot be created (FifoQueue: true with a name that has no .fifo suffix). Deploying
+  with IncludeFailure=false stores a good value; updating with a new value AND
+  IncludeFailure=true changes the parameter first and then fails, so the update must
+  roll the parameter back to its last known good value.
+
+Parameters:
+  ParameterName:
+    Type: String
+    Description: Name of the SSM parameter whose value is rolled back.
+  ParameterValue:
+    Type: String
+    Description: Value to store; the update sets this to a value that must not survive.
+  FailingQueueName:
+    Type: String
+    Description: "Queue name WITHOUT a .fifo suffix, so FifoQueue: true is rejected."
+  IncludeFailure:
+    Type: String
+    AllowedValues:
+      - "true"
+      - "false"
+    Default: "false"
+    Description: When true, add the queue that cannot be created.
+
+Conditions:
+  WithFailure: !Equals [!Ref IncludeFailure, "true"]
+
+Resources:
+  Tracked:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Ref ParameterName
+      Type: String
+      Value: !Ref ParameterValue
+
+  # DependsOn is load-bearing: it forces CloudFormation to apply the new parameter
+  # value BEFORE attempting the resource that fails, which is what makes the rollback
+  # of an already-changed resource observable.
+  Doomed:
+    Type: AWS::SQS::Queue
+    Condition: WithFailure
+    DependsOn: Tracked
+    Properties:
+      QueueName: !Ref FailingQueueName
+      FifoQueue: true
+
+Outputs:
+  TrackedParameterValue:
+    Value: !GetAtt Tracked.Value
+  TrackedParameterName:
+    Value: !Ref Tracked

@@ -1,0 +1,329 @@
+"""revoke-subscription-transitions-to-revoked."""
+from __future__ import annotations
+
+import json
+import re
+import time
+
+from behavioral_harness import tags
+
+CHECK = "revoke-subscription-transitions-to-revoked"
+GROUP = "state-machine"
+SERVICES = ["datazone"]
+
+
+@tags("axis:happy-path", "cap:c1", "cap:c4", "concern:representation", "plane:control")
+def run(ctx) -> None:
+    """RevokeSubscription moves an APPROVED subscription to REVOKED.
+
+    The request comes from a consumer-only IAM identity, as DataZone auto-approves a request from
+    an owner of the producing project and AcceptSubscriptionRequest would then be refused."""
+    dz = ctx.client("datazone")
+    iam = ctx.client("iam")
+    domain = _create_domain(ctx)
+    producer = _create_project(ctx, domain["id"])
+    consumer = _create_project(ctx, domain["id"])
+    listing_id = _publish_asset_listing(ctx, domain["id"], producer["id"])
+    requester = _create_consumer_requester(ctx, dz, iam, domain["id"], consumer["id"])
+
+    request = _retry_access_denied(
+        lambda: requester.create_subscription_request(
+            domainIdentifier=domain["id"],
+            subscribedPrincipals=[{"project": {"identifier": consumer["id"]}}],
+            subscribedListings=[{"identifier": listing_id}],
+            requestReason="sim2real behavioral check subscription revoke",
+        )
+    )
+    dz.accept_subscription_request(domainIdentifier=domain["id"], identifier=request["id"])
+    # ListSubscriptions is search-indexed and lags AcceptSubscriptionRequest's own write path.
+    created = _poll_until(
+        lambda: dz.list_subscriptions(
+            domainIdentifier=domain["id"], subscriptionRequestIdentifier=request["id"]
+        )["items"],
+        lambda items: len(items) >= 1,
+        timeout_s=60.0,
+        interval_s=3.0,
+    )
+    subscription_id = created[0]["id"]
+
+    subscription = dz.get_subscription(domainIdentifier=domain["id"], identifier=subscription_id)
+    assert subscription["status"] == "APPROVED", (
+        f"expected newly-accepted subscription {subscription_id} to be APPROVED, "
+        f"got {subscription['status']}"
+    )
+
+    revoked = dz.revoke_subscription(domainIdentifier=domain["id"], identifier=subscription_id)
+    assert revoked["status"] == "REVOKED", (
+        f"expected revoke_subscription response status REVOKED, got {revoked['status']}"
+    )
+
+    got = dz.get_subscription(domainIdentifier=domain["id"], identifier=subscription_id)
+    assert got["status"] == "REVOKED", (
+        f"expected independent get_subscription read to show REVOKED after revoke, got {got['status']}"
+    )
+
+
+# ===== helpers =====
+def _safe(fn, deadline_s=60.0):
+    """Teardown: a resource already gone is fine; ConflictException (a dependent resource is still
+    being released) is retried to a deadline; every other error raises."""
+    def _wrapped():
+        from botocore.exceptions import ClientError
+
+        deadline = time.monotonic() + deadline_s
+        while True:
+            try:
+                fn()
+                return
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code")
+                if code in ("ResourceNotFoundException", "NoSuchEntity"):
+                    return
+                if code != "ConflictException" or time.monotonic() >= deadline:
+                    raise
+            time.sleep(2)
+
+    return _wrapped
+
+
+def _poll_until(probe, predicate, *, timeout_s=60.0, interval_s=2.0):
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while time.monotonic() < deadline:
+        last = probe()
+        if predicate(last):
+            return last
+        time.sleep(interval_s)
+    raise AssertionError(f"condition not met within {timeout_s}s; last observed: {last}")
+
+
+_PROPAGATION = frozenset({
+    "AccessDeniedException",
+    "UnauthorizedException",
+    "UnrecognizedClientException",
+    "InvalidClientTokenId",
+})
+
+
+def _retry_access_denied(fn, timeout_s=90.0, interval_s=3.0):
+    """Absorb IAM access-key/identity-policy and DataZone project-membership propagation delay
+    only — never a wider retry that could paper over a real authorization defect."""
+    from botocore.exceptions import ClientError
+
+    deadline = time.monotonic() + timeout_s
+    last_exc = None
+    while time.monotonic() < deadline:
+        try:
+            return fn()
+        except ClientError as exc:
+            code = exc.response["Error"]["Code"]
+            if code in _PROPAGATION:
+                last_exc = exc
+                time.sleep(interval_s)
+                continue
+            raise
+    raise last_exc
+
+
+def _create_domain(ctx):
+    dz = ctx.client("datazone")
+    role_arn = _create_domain_execution_role(ctx)
+    name = ctx.unique_name("sim2real-dz-domain-")
+    created = _create_domain_call(dz, name, role_arn)
+    domain_id = created["id"]
+    ctx.on_cleanup(
+        _safe(lambda: dz.delete_domain(identifier=domain_id, cascadeDelete=True))
+    )
+    return _wait_domain_available(ctx, domain_id)
+
+
+def _create_domain_execution_role(ctx):
+
+    iam = ctx.client("iam")
+    role_name = ctx.unique_name("sim2real-dz-exec-")
+    trust_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "datazone.amazonaws.com"},
+                "Action": ["sts:AssumeRole", "sts:TagSession", "sts:SetContext"],
+            }
+        ],
+    }
+    role = _create_role_with_retry(iam, role_name, trust_policy)
+    role_arn = role["Role"]["Arn"]
+    ctx.on_cleanup(_safe(lambda: iam.delete_role(RoleName=role_name)))
+    return role_arn
+
+
+def _create_role_with_retry(iam, role_name, trust_policy, timeout_s=60.0):
+    deadline = time.monotonic() + timeout_s
+    last_exc = None
+    while time.monotonic() < deadline:
+        try:
+            return iam.create_role(
+                RoleName=role_name,
+                AssumeRolePolicyDocument=json.dumps(trust_policy),
+                Tags=[{"Key": "sim2real", "Value": CHECK}],
+            )
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(3)
+    raise last_exc
+
+
+def _create_domain_call(dz, name, role_arn, timeout_s=60.0):
+    from botocore.exceptions import ClientError
+
+    deadline = time.monotonic() + timeout_s
+    last_exc = None
+    while time.monotonic() < deadline:
+        try:
+            return dz.create_domain(name=name, domainExecutionRole=role_arn, tags={"sim2real": CHECK})
+        except ClientError as exc:
+            code = exc.response["Error"]["Code"]
+            if code in ("ValidationException", "AccessDeniedException"):
+                last_exc = exc
+                time.sleep(3)
+                continue
+            raise
+    raise last_exc
+
+
+def _wait_domain_available(ctx, domain_id, timeout_s=900.0):
+    dz = ctx.client("datazone")
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while time.monotonic() < deadline:
+        resp = dz.get_domain(identifier=domain_id)
+        last = resp
+        if resp["status"] == "AVAILABLE":
+            return resp
+        if resp["status"] == "CREATION_FAILED":
+            raise AssertionError(f"domain {domain_id} creation failed: {resp}")
+        time.sleep(5)
+    raise AssertionError(f"domain {domain_id} did not become AVAILABLE in time: {last}")
+
+
+def _create_project(ctx, domain_id, name=None, domain_unit_id=None):
+    dz = ctx.client("datazone")
+    name = name or ctx.unique_name("sim2real-dz-proj-")
+    kwargs = {"domainIdentifier": domain_id, "name": name}
+    if domain_unit_id:
+        kwargs["domainUnitId"] = domain_unit_id
+    resp = dz.create_project(**kwargs)
+    project_id = resp["id"]
+    ctx.on_cleanup(
+        _safe(
+            lambda: dz.delete_project(
+                domainIdentifier=domain_id, identifier=project_id, skipDeletionCheck=True
+            )
+        )
+    )
+    return resp
+
+
+def _create_minimal_asset_type(ctx, domain_id, project_id):
+    dz = ctx.client("datazone")
+    resp = dz.create_asset_type(
+        domainIdentifier=domain_id,
+        name=ctx.unique_name("Sim2realAssetType"),
+        formsInput={},
+        owningProjectIdentifier=project_id,
+    )
+    ctx.on_cleanup(
+        _safe(lambda: dz.delete_asset_type(domainIdentifier=domain_id, identifier=resp["name"]))
+    )
+    return resp
+
+
+def _publish_asset_listing(ctx, domain_id, owning_project_id):
+    dz = ctx.client("datazone")
+    asset_type = _create_minimal_asset_type(ctx, domain_id, owning_project_id)
+    asset = dz.create_asset(
+        domainIdentifier=domain_id,
+        name=ctx.unique_name("sim2real-dz-asset-"),
+        typeIdentifier=asset_type["name"],
+        owningProjectIdentifier=owning_project_id,
+    )
+    ctx.on_cleanup(_safe(lambda: dz.delete_asset(domainIdentifier=domain_id, identifier=asset["id"])))
+    change_set = dz.create_listing_change_set(
+        domainIdentifier=domain_id, entityIdentifier=asset["id"], entityType="ASSET", action="PUBLISH"
+    )
+    listing_id = change_set["listingId"]
+
+    def _delete_listing():
+        from botocore.exceptions import ClientError
+
+        try:
+            dz.delete_listing(domainIdentifier=domain_id, identifier=listing_id)
+        except ClientError as exc:
+            # An approved subscription blocks DeleteListing until it is revoked; _safe retries.
+            blocker = re.search(r"prevented by subscription (\w+)", exc.response["Error"].get("Message", ""))
+            if blocker:
+                sub = dz.get_subscription(domainIdentifier=domain_id, identifier=blocker.group(1))
+                if sub["status"] == "APPROVED":
+                    dz.revoke_subscription(domainIdentifier=domain_id, identifier=sub["id"])
+            raise
+
+    ctx.on_cleanup(_safe(_delete_listing))
+    _poll_until(
+        lambda: dz.get_listing(domainIdentifier=domain_id, identifier=listing_id),
+        lambda resp: resp["status"] == "ACTIVE",
+        timeout_s=120.0,
+        interval_s=3.0,
+    )
+    return listing_id
+
+
+def _create_consumer_requester(ctx, dz, iam, domain_id, consumer_project_id):
+    """Mint an IAM identity that is a CATALOG_CONSUMER on the consumer project and nothing else.
+
+    DataZone auto-approves a subscription request submitted by anyone who already owns the
+    producing project (the caller that built this whole check is exactly that owner), so this
+    second, deliberately weaker identity is what makes the request land as genuinely PENDING.
+    """
+    user_name = ctx.unique_name("sim2real-dz-requester-")
+    iam.create_user(UserName=user_name, Tags=[{"Key": "sim2real", "Value": CHECK}])
+    ctx.on_cleanup(_safe(lambda: iam.delete_user(UserName=user_name)))
+    user_arn = iam.get_user(UserName=user_name)["User"]["Arn"]
+
+    policy_name = "sim2real-dz-requester-policy"
+    iam.put_user_policy(
+        UserName=user_name,
+        PolicyName=policy_name,
+        PolicyDocument=json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": "datazone:CreateSubscriptionRequest", "Resource": "*"}],
+        }),
+    )
+    ctx.on_cleanup(_safe(lambda: iam.delete_user_policy(UserName=user_name, PolicyName=policy_name)))
+
+    key = iam.create_access_key(UserName=user_name)["AccessKey"]
+    ctx.on_cleanup(
+        _safe(lambda: iam.delete_access_key(UserName=user_name, AccessKeyId=key["AccessKeyId"]))
+    )
+
+    dz.create_user_profile(domainIdentifier=domain_id, userIdentifier=user_arn, userType="IAM_USER")
+    dz.create_project_membership(
+        domainIdentifier=domain_id,
+        projectIdentifier=consumer_project_id,
+        member={"userIdentifier": user_arn},
+        designation="PROJECT_CATALOG_CONSUMER",
+    )
+
+    return _client_for_credentials(ctx, key["AccessKeyId"], key["SecretAccessKey"], "datazone")
+
+
+def _client_for_credentials(ctx, access_key_id, secret_access_key, service):
+    """A client signing AS the minted principal against the same target ctx.client() uses."""
+    return ctx.client(
+        service,
+        creds={"aws_access_key_id": access_key_id, "aws_secret_access_key": secret_access_key},
+    )
+
+
+if __name__ == "__main__":
+    from fidelity_tests_runner import main
+    main(run)

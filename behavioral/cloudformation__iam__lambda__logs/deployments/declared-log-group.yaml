@@ -1,0 +1,69 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  CFN-declared Lambda log group: the group is named by the /aws/lambda/<function> convention
+  via !Sub, the execution role is scoped to that group by !GetAtt and deliberately omits
+  logs:CreateLogGroup, so log events can only appear if CloudFormation created the group at
+  the name Lambda resolves to.
+
+Parameters:
+  FunctionName:
+    Type: String
+    Description: Function name; the log group name is derived from it by convention.
+
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${FunctionName}'
+      RetentionInDays: 1
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        # Deliberately NO logs:CreateLogGroup and no wildcard resource: the function can only
+        # write into the group CloudFormation declared above, at the ARN CloudFormation resolved.
+        - PolicyName: declared-log-group-only
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt LogGroup.Arn
+
+  EmitterFunction:
+    Type: AWS::Lambda::Function
+    # The group must exist before the function can log into it, since the role cannot create it.
+    DependsOn: LogGroup
+    Properties:
+      FunctionName: !Ref FunctionName
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt ExecutionRole.Arn
+      Timeout: 10
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              marker = event.get('marker', '')
+              print('SIM2REAL_MARKER %s' % marker)
+              return {'marker': marker}
+
+Outputs:
+  LogGroupName:
+    Value: !Ref LogGroup
+  LogGroupArn:
+    Value: !GetAtt LogGroup.Arn
+  ExecutionRoleName:
+    Value: !Ref ExecutionRole
+  EmitterFunctionName:
+    Value: !Ref EmitterFunction

@@ -1,0 +1,233 @@
+"""xsvc-cognito-idp-2-avp-group-permit-allows-member-denies-non-member."""
+from __future__ import annotations
+
+import base64
+import json
+import secrets
+import time
+
+from botocore.exceptions import ClientError
+
+from behavioral_harness import tags
+
+CHECK = "xsvc-cognito-idp-2-avp-group-permit-allows-member-denies-non-member"
+GROUP = "cognito-token-authorization"
+SERVICES = ["cognito-idp", "verifiedpermissions"]
+
+_PRINCIPAL_TYPE = "App::User"
+_GROUP_TYPE = "App::UserGroup"
+_ACTION = {"actionType": "App::Action", "actionId": "read"}
+_RESOURCE = {"entityType": "App::Doc", "entityId": "doc-1"}
+_ADMINS = "admins"
+
+
+@tags("axis:happy-path", "cap:c7", "concern:data-plane", "concern:e2e", "dp:api",
+      "plane:control", "plane:data")
+def run(ctx) -> None:
+    """A Cognito ID token is turned into an AVP principal `<poolId>|<sub>` whose group
+    membership comes from the token's `cognito:groups` claim, and a group-scoped permit
+    ALLOWs the member and DENYs the non-member on the very same wiring.
+    """
+    idp = ctx.client("cognito-idp")
+    avp = ctx.client("verifiedpermissions")
+    password = _password()
+
+    pool_id, pool_arn = _make_pool(ctx, idp, "sim2real-xsvc-avp-pool-")
+    client_id = _make_client(ctx, idp, pool_id, "sim2real-xsvc-avp-client-")
+    _make_group(ctx, idp, pool_id, _ADMINS)
+    alice_sub = _make_user(ctx, idp, pool_id, "alice", password)
+    _add_to_group(ctx, idp, pool_id, "alice", _ADMINS)
+    bob_sub = _make_user(ctx, idp, pool_id, "bob", password)
+
+    store_id = _make_store(ctx, avp)
+    _make_identity_source(ctx, avp, store_id, pool_arn, [client_id])
+    policy_id = _make_group_policy(ctx, avp, store_id, pool_id, _ADMINS)
+
+    alice = _authenticate(idp, pool_id, client_id, "alice", password)
+    bob = _authenticate(idp, pool_id, client_id, "bob", password)
+
+    alice_claims = _claims(alice["IdToken"])
+    assert alice_claims.get("sub") == alice_sub, (
+        f"alice's ID token sub {alice_claims.get('sub')!r} != AdminGetUser sub {alice_sub!r}"
+    )
+    assert alice_claims.get("cognito:groups") == [_ADMINS], (
+        f"alice's ID token cognito:groups is {alice_claims.get('cognito:groups')!r}, expected {[_ADMINS]!r}"
+    )
+    assert "cognito:groups" not in _claims(bob["IdToken"]), (
+        f"bob is in no group but his ID token carries {_claims(bob['IdToken']).get('cognito:groups')!r}"
+    )
+
+    # ALLOW: the admins-group member's identity token.
+    allow = _poll_decision(avp, store_id, "ALLOW", identityToken=alice["IdToken"])
+    assert allow["decision"] == "ALLOW", f"alice (admins) got {allow['decision']!r}: {allow!r}"
+    assert [p["policyId"] for p in allow["determiningPolicies"]] == [policy_id], (
+        f"ALLOW should be determined by exactly the group permit {policy_id!r}, got "
+        f"{allow['determiningPolicies']!r}"
+    )
+    assert allow["errors"] == [], f"ALLOW carried evaluation errors {allow['errors']!r}"
+    assert allow["principal"] == {
+        "entityType": _PRINCIPAL_TYPE, "entityId": f"{pool_id}|{alice_sub}",
+    }, f"principal for alice is {allow['principal']!r}, expected {_PRINCIPAL_TYPE}::\"{pool_id}|{alice_sub}\""
+
+    # The same user's ACCESS token resolves to the same principal and the same decision.
+    via_access = _authorize(avp, store_id, accessToken=alice["AccessToken"])
+    assert via_access["decision"] == "ALLOW", f"alice's access token got {via_access!r}"
+    assert via_access["principal"] == allow["principal"], (
+        f"access-token principal {via_access['principal']!r} != id-token principal {allow['principal']!r}"
+    )
+
+    # DENY: the positive-control user on the SAME pool, client and policy store, not in admins.
+    deny = _authorize(avp, store_id, identityToken=bob["IdToken"])
+    assert deny["decision"] == "DENY", f"bob (no group) got {deny['decision']!r}: {deny!r}"
+    assert deny["determiningPolicies"] == [], (
+        f"a default DENY names no determining policy, got {deny['determiningPolicies']!r}"
+    )
+    assert deny["errors"] == [], f"DENY carried evaluation errors {deny['errors']!r}"
+    assert deny["principal"] == {
+        "entityType": _PRINCIPAL_TYPE, "entityId": f"{pool_id}|{bob_sub}",
+    }, f"principal for bob is {deny['principal']!r}, expected {_PRINCIPAL_TYPE}::\"{pool_id}|{bob_sub}\""
+    assert alice_sub != bob_sub, f"two users share one sub {alice_sub!r}"
+
+
+def _password() -> str:
+    # Satisfies the default Cognito password policy (upper, lower, digit, symbol, >= 8).
+    return "Aa1!" + secrets.token_urlsafe(18)
+
+
+def _make_pool(ctx, idp, prefix):
+    pool = idp.create_user_pool(
+        PoolName=ctx.unique_name(prefix),
+        DeletionProtection="INACTIVE",
+        UserPoolTags={"sim2real": CHECK},
+    )["UserPool"]
+    pool_id = pool["Id"]
+    ctx.on_cleanup(lambda: idp.delete_user_pool(UserPoolId=pool_id))
+    return pool_id, pool["Arn"]
+
+
+def _make_client(ctx, idp, pool_id, prefix):
+    client_id = idp.create_user_pool_client(
+        UserPoolId=pool_id,
+        ClientName=ctx.unique_name(prefix),
+        ExplicitAuthFlows=["ALLOW_ADMIN_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    ctx.on_cleanup(lambda: idp.delete_user_pool_client(UserPoolId=pool_id, ClientId=client_id))
+    return client_id
+
+
+def _make_group(ctx, idp, pool_id, name):
+    idp.create_group(UserPoolId=pool_id, GroupName=name)
+    ctx.on_cleanup(lambda: idp.delete_group(UserPoolId=pool_id, GroupName=name))
+
+
+def _make_user(ctx, idp, pool_id, username, password):
+    idp.admin_create_user(UserPoolId=pool_id, Username=username, MessageAction="SUPPRESS")
+    ctx.on_cleanup(lambda: idp.admin_delete_user(UserPoolId=pool_id, Username=username))
+    idp.admin_set_user_password(
+        UserPoolId=pool_id, Username=username, Password=password, Permanent=True
+    )
+    attrs = idp.admin_get_user(UserPoolId=pool_id, Username=username)["UserAttributes"]
+    subs = [a["Value"] for a in attrs if a["Name"] == "sub"]
+    assert len(subs) == 1, f"AdminGetUser for {username!r} returned sub attributes {subs!r}"
+    return subs[0]
+
+
+def _add_to_group(ctx, idp, pool_id, username, group):
+    idp.admin_add_user_to_group(UserPoolId=pool_id, Username=username, GroupName=group)
+    ctx.on_cleanup(lambda: idp.admin_remove_user_from_group(
+        UserPoolId=pool_id, Username=username, GroupName=group))
+
+
+def _authenticate(idp, pool_id, client_id, username, password):
+    resp = idp.admin_initiate_auth(
+        UserPoolId=pool_id,
+        ClientId=client_id,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": username, "PASSWORD": password},
+    )
+    result = resp.get("AuthenticationResult")
+    assert result and result.get("IdToken") and result.get("AccessToken"), (
+        f"AdminInitiateAuth for {username!r} returned no tokens: "
+        f"{ {k: v for k, v in resp.items() if k != 'ResponseMetadata'}!r}"
+    )
+    return result
+
+
+def _claims(jwt):
+    parts = jwt.split(".")
+    assert len(parts) == 3, f"token is not a three-part JWT: {len(parts)} parts"
+    body = parts[1] + "=" * (-len(parts[1]) % 4)
+    return json.loads(base64.urlsafe_b64decode(body))
+
+
+def _retry_not_found(fn, timeout_s=60.0, interval_s=2.0):
+    """A just-created policy store is briefly invisible to its own sub-resource calls
+    (CreateIdentitySource -> ResourceNotFoundException 'Policy Store does not exist' for
+    ~2 s). Retry only that code, bounded."""
+    deadline = time.time() + timeout_s
+    while True:
+        try:
+            return fn()
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "ResourceNotFoundException" or time.time() > deadline:
+                raise
+            time.sleep(interval_s)
+
+
+def _make_store(ctx, avp):
+    store_id = avp.create_policy_store(
+        validationSettings={"mode": "OFF"},
+        description=ctx.unique_name("sim2real-xsvc-avp-store-"),
+        deletionProtection="DISABLED",
+        tags={"sim2real": CHECK},
+    )["policyStoreId"]
+    ctx.on_cleanup(lambda: avp.delete_policy_store(policyStoreId=store_id))
+    return store_id
+
+
+def _make_identity_source(ctx, avp, store_id, pool_arn, client_ids):
+    source_id = _retry_not_found(lambda: avp.create_identity_source(
+        policyStoreId=store_id,
+        principalEntityType=_PRINCIPAL_TYPE,
+        configuration={"cognitoUserPoolConfiguration": {
+            "userPoolArn": pool_arn,
+            "clientIds": list(client_ids),
+            "groupConfiguration": {"groupEntityType": _GROUP_TYPE},
+        }},
+    ))["identitySourceId"]
+    ctx.on_cleanup(lambda: avp.delete_identity_source(
+        policyStoreId=store_id, identitySourceId=source_id))
+    return source_id
+
+
+def _make_group_policy(ctx, avp, store_id, pool_id, group):
+    statement = (
+        f'permit(principal in {_GROUP_TYPE}::"{pool_id}|{group}", '
+        f'action == {_ACTION["actionType"]}::"{_ACTION["actionId"]}", resource);'
+    )
+    policy_id = _retry_not_found(lambda: avp.create_policy(
+        policyStoreId=store_id, definition={"static": {"statement": statement}},
+    ))["policyId"]
+    ctx.on_cleanup(lambda: avp.delete_policy(policyStoreId=store_id, policyId=policy_id))
+    return policy_id
+
+
+def _authorize(avp, store_id, **token):
+    return _retry_not_found(lambda: avp.is_authorized_with_token(
+        policyStoreId=store_id, action=_ACTION, resource=_RESOURCE, **token))
+
+
+def _poll_decision(avp, store_id, want, timeout_s=60.0, interval_s=2.0, **token):
+    """Poll until the decision is `want`: a just-written policy or identity-source update
+    is eventually consistent. Returns the last response either way; the caller asserts."""
+    deadline = time.time() + timeout_s
+    while True:
+        resp = _authorize(avp, store_id, **token)
+        if resp["decision"] == want or time.time() > deadline:
+            return resp
+        time.sleep(interval_s)
+
+
+if __name__ == "__main__":
+    from fidelity_tests_runner import main
+    main(run)

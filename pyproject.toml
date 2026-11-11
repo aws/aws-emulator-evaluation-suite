@@ -1,0 +1,116 @@
+[project]
+name = "fidelity-tests-runner"
+version = "1.0.0"
+description = "Run self-contained AWS behavioral fidelity tests against an AWS emulator."
+readme = "README.md"
+license = "CC0-1.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    "boto3>=1.43.108",
+    "botocore>=1.43.108",
+    "certifi>=2024.2",
+]
+
+[project.optional-dependencies]
+# What the fidelity tests themselves import (`fidelity-tests-runner requirements` lists one file's).
+# botocore[crt] signs SigV4a (CloudFront KeyValueStore) and computes CRC64NVME checksums.
+checks = [
+    "acme>=5.10",
+    "aiortc>=1.16",
+    "aws-cdk-lib>=2.263",
+    "botocore[crt]>=1.43.108",
+    "cassandra-driver>=3.30",
+    "cassandra-sigv4>=4.0",
+    "constructs>=10.8",
+    "cryptography>=45",
+    "josepy>=2.3",
+    "kafka-python>=2.2",
+    "kubernetes>=33",
+    "opensearch-py>=3.2",
+    "paho-mqtt>=2.1",
+    "paramiko>=4",
+    "pg8000>=1.31",
+    "pillow>=13.0",
+    "psycopg[binary]>=3.2",
+    "pyarrow>=20",
+    "PyMySQL>=1.1",
+    "PyYAML>=6",
+    "requests>=2.32",
+    "requests-aws4auth>=1.4",
+    "sagemaker-core>=2",
+    "urllib3>=2.5",
+    "websockets>=17.4",
+]
+
+[project.scripts]
+fidelity-tests-runner = "fidelity_tests_runner.cli:main"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4",
+    "pytest>=8.4",
+    "pytest-xdist>=3.6",
+    "ruff>=0.15",
+]
+
+[tool.uv]
+# uv.lock resolves the test packages to the versions published scores are produced with.
+constraint-dependencies = [
+    "acme==5.10.0",
+    "aiortc==1.16.0",
+    "aws-cdk-lib==2.263.0",
+    "awscrt==0.36.0",
+    "boto3==1.43.108",
+    "botocore==1.43.108",
+    "cassandra-driver==3.30.1",
+    "cassandra-sigv4==4.0.2",
+    "certifi==2026.10.18",
+    "constructs==10.8.1",
+    "cryptography==50.0.1",
+    "josepy==2.3.0",
+    "kafka-python==3.0.11",
+    "kubernetes==36.0.3",
+    "oauthlib>=4.0.1",
+    "opensearch-py==3.2.0",
+    "paho-mqtt==2.1.0",
+    "paramiko==5.0.0",
+    "pg8000==1.31.6",
+    "pillow==13.0.0",
+    "psycopg==3.3.6",
+    "pyarrow==25.0.1",
+    "PyMySQL==1.2.3",
+    "PyYAML==6.0.3",
+    "requests==2.34.2",
+    "requests-aws4auth==1.4.0",
+    "sagemaker-core==2.22.1",
+    "urllib3==2.8.0",
+    "websockets==17.4",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fidelity_tests_runner"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/behavioral_harness.py" = "behavioral_harness.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -p no:cacheprovider"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# The fidelity tests are generated and published as-is: never lint or format them here.
+extend-exclude = ["behavioral"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "T20", "PLC0415"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/fidelity_tests_runner/cli.py" = ["T20"]
+"tests/*.py" = ["PLC0415"]

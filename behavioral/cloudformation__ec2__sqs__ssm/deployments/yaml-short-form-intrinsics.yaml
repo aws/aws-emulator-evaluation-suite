@@ -1,0 +1,112 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Exercises the YAML short-form intrinsics an emulator has to interpret rather
+  than merely parse: !FindInMap driving a Condition, !If choosing both branches,
+  !Ref AWS::NoValue eliding a property, !Sub over pseudo parameters and a GetAtt,
+  !Join/!Select/!Split, !GetAZs, !Base64, plus resource- and output-level
+  Conditions built from Fn::And / Fn::Or / Fn::Not.
+
+Parameters:
+  QueueBaseName:
+    Type: String
+    Description: Base queue name; the FIFO branch appends the mandatory .fifo suffix.
+  LabelParameterName:
+    Type: String
+    Description: SSM parameter that receives the !Join/!Select/!Split value.
+  AzParameterName:
+    Type: String
+    Description: SSM parameter that receives a !GetAZs entry.
+  ModeParameterName:
+    Type: String
+    Description: SSM parameter that receives the !If branch label.
+  Ordering:
+    Type: String
+    AllowedValues: [ordered, unordered]
+    Description: Mappings key selecting FIFO-ness and the receive wait time.
+  EnableEncryption:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Description: Left operand of the Fn::And that gates the KMS property.
+
+Mappings:
+  OrderingMap:
+    ordered:
+      Fifo: 'true'
+      WaitSeconds: '17'
+    unordered:
+      Fifo: 'false'
+      WaitSeconds: '3'
+
+Conditions:
+  # Derived from a Mappings lookup, not from the parameter directly.
+  IsFifo: !Equals [!FindInMap [OrderingMap, !Ref Ordering, Fifo], 'true']
+  UseKms: !And
+    - !Equals [!Ref EnableEncryption, 'true']
+    - !Condition IsFifo
+  PublishLabel: !Or
+    - !Equals [!Ref Ordering, ordered]
+    - !Equals [!Ref Ordering, unordered]
+  PlainMode: !Not [!Condition UseKms]
+
+Resources:
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !If [IsFifo, !Sub '${QueueBaseName}.fifo', !Ref QueueBaseName]
+      FifoQueue: !If [IsFifo, true, !Ref 'AWS::NoValue']
+      ContentBasedDeduplication: !If [IsFifo, true, !Ref 'AWS::NoValue']
+      ReceiveMessageWaitTimeSeconds: !FindInMap [OrderingMap, !Ref Ordering, WaitSeconds]
+      # False branch must ELIDE the property, not set it to an empty string.
+      KmsMasterKeyId: !If [UseKms, alias/aws/sqs, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: sim2real:managed
+          Value: 'true'
+        - Key: sim2real:prefix
+          Value: sim2real-xsvc
+
+  LabelParameter:
+    Type: AWS::SSM::Parameter
+    Condition: PublishLabel
+    Properties:
+      Name: !Ref LabelParameterName
+      Type: String
+      Value: !Join
+        - '-'
+        - - !Ref Ordering
+          - !Select [1, !Split ['-', !Ref 'AWS::Region']]
+
+  AzParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Ref AzParameterName
+      Type: String
+      Value: !Select [0, !GetAZs '']
+
+  ModeParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Ref ModeParameterName
+      Type: String
+      Value: !If [UseKms, encrypted, plain]
+
+Outputs:
+  QueueUrl:
+    Value: !Ref Queue
+  QueueNameOut:
+    Value: !GetAtt Queue.QueueName
+  QueueArn:
+    Value: !GetAtt Queue.Arn
+  ExpectedQueueArn:
+    Value: !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${Queue.QueueName}'
+  WaitSecondsFromMap:
+    Value: !FindInMap [OrderingMap, !Ref Ordering, WaitSeconds]
+  OrderingBase64:
+    # Two short-form tags cannot nest on one node, so Fn::Base64 is spelled long-form.
+    Value:
+      Fn::Base64: !Ref Ordering
+  PlainModeNote:
+    Condition: PlainMode
+    Value: plain-mode
+  KmsAliasUsed:
+    Condition: UseKms
+    Value: alias/aws/sqs

@@ -1,0 +1,40 @@
+"""error-query-without-key-condition."""
+from __future__ import annotations
+
+from botocore.exceptions import ClientError
+
+from behavioral_harness import tags
+
+CHECK = "error-query-without-key-condition"
+GROUP = 'errors'
+SERVICES = ['dynamodb']
+ERR_VALIDATION = 'ValidationException'
+
+
+@tags("axis:rejection", "cap:c2", "concern:negative-classes", "dp:api", "plane:data")
+def run(ctx) -> None:
+    """Query without KeyConditionExpression raises ValidationException; the same table accepts a properly-keyed Query."""
+    ddb = ctx.client('dynamodb')
+    table = ctx.unique_name('sim2real-behav-')
+    ddb.create_table(TableName=table, KeySchema=[{'AttributeName': 'pk', 'KeyType': 'HASH'}], AttributeDefinitions=[{'AttributeName': 'pk', 'AttributeType': 'S'}], BillingMode='PAY_PER_REQUEST', Tags=[{'Key': 'sim2real', 'Value': CHECK}])
+    ctx.on_cleanup(lambda: ddb.delete_table(TableName=table))
+    ddb.get_waiter('table_exists').wait(TableName=table, WaiterConfig={"Delay": 2, "MaxAttempts": 250})
+
+    control = ddb.query(TableName=table, KeyConditionExpression='pk = :pk', ExpressionAttributeValues={':pk': {'S': 'x'}})
+    assert control['Items'] == [], f"positive control: expected no items on a fresh table, got {control['Items']}"
+
+    try:
+        ddb.query(TableName=table, FilterExpression='pk = :pk', ExpressionAttributeValues={':pk': {'S': 'x'}})
+        code = None
+        message = None
+    except ClientError as exc:
+        code = exc.response.get('Error', {}).get('Code')
+        message = exc.response.get('Error', {}).get('Message')
+    assert code == ERR_VALIDATION, f'expected {ERR_VALIDATION}, got {code}'
+    assert message == "Either the KeyConditions or KeyConditionExpression parameter must be specified in the request.", (
+        f"expected the exact ValidationException message AWS returns, got {message!r}"
+    )
+
+if __name__ == "__main__":
+    from fidelity_tests_runner import main
+    main(run)

@@ -1,0 +1,48 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  InheritsName:
+    Type: String
+  OverridesName:
+    Type: String
+Globals:
+  Function:
+    Runtime: python3.13
+    Handler: index.handler
+    MemorySize: 256
+    Timeout: 7
+    Environment:
+      Variables:
+        ALPHA: global
+        BRAVO: global
+    Tags:
+      tier: global
+      owner: global
+Resources:
+  Inherits:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref InheritsName
+      InlineCode: |
+        import os
+
+
+        def handler(event, context):
+            return {k: os.environ.get(k) for k in ("ALPHA", "BRAVO", "CHARLIE")}
+  Overrides:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref OverridesName
+      MemorySize: 512
+      Environment:
+        Variables:
+          BRAVO: function
+          CHARLIE: function
+      Tags:
+        owner: function
+      InlineCode: |
+        import os
+
+
+        def handler(event, context):
+            return {k: os.environ.get(k) for k in ("ALPHA", "BRAVO", "CHARLIE")}

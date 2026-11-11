@@ -1,0 +1,90 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Registers a customer CloudFormation macro: the Lambda that transforms a template
+  fragment, plus the AWS::CloudFormation::Macro registry entry that binds a macro
+  name to it. The macro injects an AWS::SSM::Parameter resource (and an Output) built
+  from the transform's own Parameters, so a consumer template that declares no SSM
+  parameter still ends up with a real one.
+
+Parameters:
+  MacroName:
+    Type: String
+    Description: Macro name consumer templates reference in their Transform block.
+
+Resources:
+  MacroRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BasicExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  MacroFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt MacroRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          """CloudFormation macro: inject an SSM parameter named by the transform params."""
+
+          def handler(event, context):
+              fragment = event["fragment"]
+              params = event.get("params") or {}
+              name = params["ParameterName"]
+              value = params["ParameterValue"]
+              fragment.setdefault("Resources", {})["MacroInjectedParameter"] = {
+                  "Type": "AWS::SSM::Parameter",
+                  "Properties": {"Name": name, "Type": "String", "Value": value},
+              }
+              # Injecting an Output too proves CFN adopts the WHOLE returned fragment.
+              fragment.setdefault("Outputs", {})["MacroInjectedParameterName"] = {
+                  "Value": name
+              }
+              return {
+                  "requestId": event["requestId"],
+                  "status": "success",
+                  "fragment": fragment,
+              }
+      Tags:
+        - Key: sim2real:managed
+          Value: 'true'
+        - Key: sim2real:prefix
+          Value: sim2real-xsvc
+
+  MacroInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt MacroFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: cloudformation.amazonaws.com
+
+  Macro:
+    Type: AWS::CloudFormation::Macro
+    Properties:
+      Name: !Ref MacroName
+      Description: sim2real macro that injects an SSM parameter into a consumer template
+      FunctionName: !GetAtt MacroFunction.Arn
+
+Outputs:
+  MacroName:
+    Value: !Ref Macro
+  MacroFunctionArn:
+    Value: !GetAtt MacroFunction.Arn

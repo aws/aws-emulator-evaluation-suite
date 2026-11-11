@@ -1,0 +1,156 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Service child: the ECR repository, the ECS cluster, the task definition and the Fargate service that
+  registers into a target group it learned about from a SIBLING stack.
+
+# TargetGroupArn, SecurityGroupId and LogGroupNameFromObservability all arrive as parameters the parent
+# filled from another child's Outputs. Nothing in this file names either sibling, so a service that ends
+# up healthy behind the load balancer is proof the nested-stack output plumbing was evaluated.
+#
+# The task pulls a PUBLIC image. The ECR repository is deployed and asserted as a resource (its URI, its
+# scan-on-push setting and its lifecycle policy) but nothing is pushed to it: an anonymous public pull
+# keeps this check about nested stacks and container networking rather than about registry credentials.
+#
+# Changing Marker rewrites the container command, which makes AWS::ECS::TaskDefinition a REPLACEMENT
+# (a new revision) while AWS::ECS::Service stays a modify - the pair the update leg asserts.
+
+Parameters:
+  ClusterName:
+    Type: String
+  ServiceName:
+    Type: String
+  TaskFamily:
+    Type: String
+  RepositoryName:
+    Type: String
+  ContainerImage:
+    Type: String
+  Marker:
+    Type: String
+  DesiredCount:
+    Type: Number
+    Default: 1
+  SubnetIds:
+    Type: CommaDelimitedList
+  TargetGroupArn:
+    Type: String
+  SecurityGroupId:
+    Type: String
+  LogGroupNameFromObservability:
+    Type: String
+
+Resources:
+  ImageRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: MUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"expire untagged after a day","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":1},"action":{"type":"expire"}}]}'
+
+  PlatformCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ClusterName
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: execution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogGroupNameFromObservability}:*'
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+
+  PlatformTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref TaskFamily
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref ContainerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroupNameFromObservability
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: ecs
+          Command:
+            - sh
+            - -c
+            # A block scalar, so the backslashes reach the shell literally and the container emits a
+            # JSON line the observability child's metric filter can match. The body carries the marker
+            # so a request through the load balancer can be attributed to THIS task revision.
+            - !Sub |
+              mkdir -p /www
+              echo "${Marker} $(hostname)" > /www/index.html
+              echo "{\"event\":\"service.started\",\"marker\":\"${Marker}\",\"host\":\"$(hostname)\"}"
+              exec httpd -f -v -p 80 -h /www
+
+  PlatformService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Ref ServiceName
+      Cluster: !Ref PlatformCluster
+      TaskDefinition: !Ref PlatformTask
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 120
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          # ENABLED because the default subnets route to an internet gateway: the task needs a public
+          # address to pull the public image, and this avoids provisioning a billable NAT gateway.
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref SecurityGroupId
+          Subnets: !Ref SubnetIds
+      LoadBalancers:
+        - TargetGroupArn: !Ref TargetGroupArn
+          ContainerName: app
+          ContainerPort: 80
+
+Outputs:
+  ClusterNameOut:
+    Value: !Ref PlatformCluster
+  ServiceNameOut:
+    Value: !GetAtt PlatformService.Name
+  TaskDefinitionArn:
+    Value: !Ref PlatformTask
+  RepositoryUri:
+    Value: !GetAtt ImageRepository.RepositoryUri
+  ExecutionRoleArn:
+    Value: !GetAtt TaskExecutionRole.Arn

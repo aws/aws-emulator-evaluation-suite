@@ -1,0 +1,47 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  FunctionName:
+    Type: String
+  BucketName:
+    Type: String
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+  Fn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 10
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref BucketName
+      InlineCode: |
+        import urllib.parse
+
+        import boto3
+
+        s3 = boto3.client("s3")
+
+
+        def handler(event, context):
+            for record in event["Records"]:
+                bucket = record["s3"]["bucket"]["name"]
+                key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
+                marker_key = "marker/" + key.split("/", 1)[1]
+                s3.put_object(Bucket=bucket, Key=marker_key, Body=key.encode())
+      Events:
+        Created:
+          Type: S3
+          Properties:
+            Bucket: !Ref Bucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: trigger/

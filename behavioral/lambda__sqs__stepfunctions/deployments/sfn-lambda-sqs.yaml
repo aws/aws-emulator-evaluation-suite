@@ -1,0 +1,108 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: SFN + Lambda + SQS cross-service stack
+
+Resources:
+  ResultQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'sim2real-xsvc-result-${AWS::StackName}'
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'sim2real-xsvc-lrole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt ResultQueue.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  ProcessorFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'sim2real-xsvc-proc-${AWS::StackName}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          RESULT_QUEUE_URL: !Ref ResultQueue
+      Code:
+        ZipFile: |
+          import boto3, os, json
+          def lambda_handler(event, context):
+              sqs = boto3.client('sqs')
+              sqs.send_message(QueueUrl=os.environ['RESULT_QUEUE_URL'], MessageBody=json.dumps(event))
+              return {'ok': True}
+
+  SfnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'sim2real-xsvc-sfnrole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SfnPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt ProcessorFn.Arn
+
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub 'sim2real-xsvc-sm-${AWS::StackName}'
+      RoleArn: !GetAtt SfnRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Invoke Lambda",
+          "StartAt": "InvokeLambda",
+          "States": {
+            "InvokeLambda": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ProcessorFn.Arn}",
+                "Payload.$": "$"
+              },
+              "ResultSelector": {
+                "body.$": "$.Payload"
+              },
+              "End": true
+            }
+          }
+        }
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref StateMachine
+  ResultQueueUrl:
+    Value: !Ref ResultQueue
+  FunctionArn:
+    Value: !GetAtt ProcessorFn.Arn

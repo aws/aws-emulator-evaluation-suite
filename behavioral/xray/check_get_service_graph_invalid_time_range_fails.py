@@ -1,0 +1,48 @@
+"""get-service-graph-invalid-time-range-fails."""
+from __future__ import annotations
+
+import time
+
+from botocore.exceptions import ClientError
+
+from behavioral_harness import tags
+
+CHECK = "get-service-graph-invalid-time-range-fails"
+GROUP = 'overly-permissive'
+SERVICES = ['xray']
+
+
+def _error(fn):
+    """Call fn(); return its error (code, message). An unexpected success raises."""
+    try:
+        result = fn()
+    except ClientError as exc:
+        error = exc.response.get("Error", {})
+        return error.get("Code"), error.get("Message")
+    raise AssertionError(
+        f"expected InvalidRequestException, but the call SUCCEEDED and returned {result!r}"
+    )
+
+
+@tags("axis:rejection", "cap:c2", "concern:negative-classes", "dp:api", "plane:data")
+def run(ctx) -> None:
+    """GetServiceGraph with EndTime before StartTime fails with InvalidRequestException and the
+    exact message, while a well-formed window returns Services."""
+    xr = ctx.client("xray")
+    now = time.time()
+
+    code, message = _error(
+        lambda: xr.get_service_graph(StartTime=now, EndTime=now - 7200)
+    )
+    assert code == "InvalidRequestException", f"expected InvalidRequestException, got {code}"
+    assert message == "End time cannot be earlier than start time", (
+        f"unexpected message: {message!r}"
+    )
+
+    resp = xr.get_service_graph(StartTime=now - 3600, EndTime=now)
+    assert "Services" in resp, f"missing Services key: {list(resp)}"
+
+
+if __name__ == "__main__":
+    from fidelity_tests_runner import main
+    main(run)

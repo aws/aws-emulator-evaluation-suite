@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      # Every action is pinned to a full commit SHA; the comment names its release.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.11.23"
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked --extra checks
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      # The tests make no Python-level socket connection off the runner (tests/conftest.py);
+      # this is a test hygiene check, not an egress control on the runner.
+      - run: uv run pytest -n 2
+      - run: uv run pre-commit run --all-files

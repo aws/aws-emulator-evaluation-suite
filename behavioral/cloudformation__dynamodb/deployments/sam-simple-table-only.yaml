@@ -1,0 +1,27 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  The smallest possible macro-bearing template: one AWS::Serverless::SimpleTable and
+  nothing else. The Transform is the whole point -- CloudFormation must refuse to
+  create this stack until the caller acknowledges CAPABILITY_AUTO_EXPAND -- and the
+  SimpleTable expands to a single AWS::DynamoDB::Table with a `pk` HASH key, so the
+  expansion is verifiable through DynamoDB's own API. No IAM, no function code, and
+  no S3 artifact, so CAPABILITY_AUTO_EXPAND is the only capability in play.
+
+Parameters:
+  TableName:
+    Type: String
+    Description: Name of the table the transform is expected to produce.
+
+Resources:
+  GatedTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      TableName: !Ref TableName
+      PrimaryKey:
+        Name: pk
+        Type: String
+
+Outputs:
+  TableNameOut:
+    Value: !Ref GatedTable
