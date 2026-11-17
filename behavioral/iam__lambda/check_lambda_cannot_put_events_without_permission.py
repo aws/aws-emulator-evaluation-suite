@@ -350,12 +350,10 @@ def _create_function_with_retry(
             resp = lam.create_function(**kwargs)
             ctx.on_cleanup(lambda: lam.delete_function(FunctionName=name))
             # The function auto-creates /aws/lambda/<name> on first invoke and that log group survives
-            # function deletion, so delete it too (best-effort — on_cleanup swallows if it was never
-            # created).
+            # function deletion, so delete it too (it exists only once the function has logged, so
+            # not-found is fine).
             ctx.on_cleanup(
-                lambda: ctx.client("logs").delete_log_group(
-                    logGroupName=f"/aws/lambda/{name}"
-                )
+                lambda: _delete_function_log_group(ctx, f"/aws/lambda/{name}")
             )
             _wait_function_active(ctx, name)
             return {"name": name, "arn": resp["FunctionArn"]}
@@ -498,6 +496,15 @@ def _drain_queue(ctx, queue_url, rounds=3) -> None:
         )
         for msg in resp.get("Messages", []):
             sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+
+
+def _delete_function_log_group(ctx, name: str) -> None:
+    """Delete a function's log group, which exists only once the function has written a log line."""
+    logs = ctx.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=name)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
 
 
 if __name__ == "__main__":

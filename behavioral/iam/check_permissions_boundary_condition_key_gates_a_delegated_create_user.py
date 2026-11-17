@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 
 from botocore.exceptions import ClientError
@@ -142,7 +143,9 @@ def run(ctx) -> None:
         f"signed call must be refused with exactly AccessDenied; got {no_boundary!r} -- an emulator "
         f"that never exposes the parameter as a condition key creates an UNBOUNDED user here"
     )
-    expected = _create_user_denial(admin_arn, account, scope_path, omitted)
+    expected = _expected_denial(
+        no_boundary_message, _create_user_denial(admin_arn, account, scope_path, omitted)
+    )
     assert no_boundary_message == expected, (
         f"expected message {expected!r}, got {no_boundary_message!r}"
     )
@@ -161,7 +164,9 @@ def run(ctx) -> None:
         f"{wrong_boundary!r} -- an emulator that only checks the parameter is PRESENT passes the "
         f"omitted case and fails here"
     )
-    expected = _create_user_denial(admin_arn, account, scope_path, wrong)
+    expected = _expected_denial(
+        wrong_boundary_message, _create_user_denial(admin_arn, account, scope_path, wrong)
+    )
     assert wrong_boundary_message == expected, (
         f"expected message {expected!r}, got {wrong_boundary_message!r}"
     )
@@ -231,6 +236,22 @@ def _rejected(fn):
         error = exc.response.get("Error", {})
         return error.get("Code") or "NO_ERROR_CODE", error.get("Message")
     raise AssertionError(f"real AWS refuses this call, but it SUCCEEDED and returned {result!r}")
+
+
+# IAM ends a denial with a pointer to a per-request authorization id, given twice (in a console URL
+# and on its own); every other character is graded.
+_AUTHZ_TAIL = (
+    r"\. Go to https://[a-z0-9-]+\.console\.aws\.amazon\.com/iam/home\?region=[a-z0-9-]+"
+    r"#/authorization-details/(\w+) for complete details, or call the "
+    r"GetRequestAuthorizationDetails API with the following authorization id: \1"
+)
+
+
+def _expected_denial(message, head):
+    """``head`` followed by the authorization-details pointer that ends ``message``: the pointer's
+    region and per-request authorization id are the only parts read back from it."""
+    found = re.search(_AUTHZ_TAIL + r"\Z", message or "")
+    return head + (found.group(0) if found else ". Go to <authorization-details pointer>")
 
 
 def _create_user_denial(caller_arn, account, path, user):

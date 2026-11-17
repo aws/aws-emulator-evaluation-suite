@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 from botocore.exceptions import ClientError
 
@@ -31,7 +32,7 @@ def run(ctx) -> None:
         SecretString=json.dumps({"clientSecret": "real-oauth-client-secret"}),
     )
     initial_secret_arn = initial_secret["ARN"]
-    ctx.on_cleanup(lambda: secretsmanager.delete_secret(SecretId=initial_secret_arn, ForceDeleteWithoutRecovery=True))
+    ctx.on_cleanup(lambda: _delete_secret(secretsmanager, initial_secret_arn))
 
     name = ctx.unique_name("sim2real-oauth2cred-")
     control.create_oauth2_credential_provider(
@@ -57,7 +58,7 @@ def run(ctx) -> None:
         SecretString=json.dumps({"clientSecret": "real-rotated-oauth-client-secret"}),
     )
     rotated_secret_arn = rotated_secret["ARN"]
-    ctx.on_cleanup(lambda: secretsmanager.delete_secret(SecretId=rotated_secret_arn, ForceDeleteWithoutRecovery=True))
+    ctx.on_cleanup(lambda: _delete_secret(secretsmanager, rotated_secret_arn))
 
     kms.disable_key(KeyId=rotated_key_id)
 
@@ -124,6 +125,19 @@ def _client_error(fn):
         error = err.response["Error"]
         return error.get("Code"), error.get("Message")
     raise AssertionError(f"expected rejection, but the call SUCCEEDED and returned {result!r}")
+
+
+def _delete_secret(secretsmanager, secret_arn: str, timeout_s: float = 25.0) -> None:
+    """Force-delete a secret and wait until it reads as gone, so its KMS key is retired after it."""
+    secretsmanager.delete_secret(SecretId=secret_arn, ForceDeleteWithoutRecovery=True)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:  # the secret deletes in the background
+        try:
+            secretsmanager.describe_secret(SecretId=secret_arn)
+        except secretsmanager.exceptions.ResourceNotFoundException:
+            return
+        time.sleep(2.0)
+    raise AssertionError(f"secret {secret_arn} still present {timeout_s}s after its delete")
 
 
 def _best_effort_delete(control, name: str) -> None:

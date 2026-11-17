@@ -19,7 +19,7 @@ from pathlib import Path
 from types import FrameType
 from typing import Any
 
-from fidelity_tests_runner import isolate, verdicts
+from fidelity_tests_runner import egress, isolate, verdicts
 from fidelity_tests_runner.budget import (
     RETRY_BUDGET_S,
     check_budget,
@@ -331,38 +331,44 @@ def run_check(
             runner_fault=FAULT_SETUP,
         )
     target["endpoint"] = str(getattr(ctx, "_endpoint", "") or "")
-
-    check_tags = tuple(getattr(fn, "__fidelity_test_tags__", ()))
-    budget = check_budget(check_tags, explicit=timeout_s, tools=_tools_of(fn))
-    try:
-        prepared = prepare_check(
-            check_tags, lambda svc: ctx.client(svc), unique_name=getattr(ctx, "unique_name", None)
-        )
-        prepared.__enter__()
-    except (Exception, NonLocalHostRefused) as exc:  # the check never ran
-        return result(
-            False,
-            _failure_detail(exc, "account setup failed:\n"),
-            VERDICT_ERROR,
-            exc=exc,
-            setup=True,
-            site=failure_site(exc, fn),
-            budget_s=budget,
-        )
-    # Registered first, so it runs last: the test's own teardowns may need what it set up.
-    release = _Once(lambda: prepared.__exit__(None, None, None))
-    ctx.on_cleanup(release)
-    clock["started"] = time.perf_counter()  # the measurement is the check's, not its setup
-
-    def failed(exc: BaseException, **extra: Any) -> CheckResult:
-        """A runner failure graded through ``result``."""
-        graded = _runner_failure(name, group, service, exc)
+    # A test that dials a host itself is refused like an SDK request (egress.guarding).
+    own_hosts = getattr(getattr(ctx, "_own", None), "entries", ())
+    with egress.guarding(target["endpoint"], own_hosts):
+        check_tags = tuple(getattr(fn, "__fidelity_test_tags__", ()))
+        budget = check_budget(check_tags, explicit=timeout_s, tools=_tools_of(fn))
         try:
-            return result(False, graded.detail, VERDICT_ERROR, runner_fault=FAULT_RUNNER, **extra)
-        except Exception:  # result() itself failed: grade without it
-            return graded
+            prepared = prepare_check(
+                check_tags,
+                lambda svc: ctx.client(svc),
+                unique_name=getattr(ctx, "unique_name", None),
+            )
+            prepared.__enter__()
+        except (Exception, NonLocalHostRefused) as exc:  # the check never ran
+            return result(
+                False,
+                _failure_detail(exc, "account setup failed:\n"),
+                VERDICT_ERROR,
+                exc=exc,
+                setup=True,
+                site=failure_site(exc, fn),
+                budget_s=budget,
+            )
+        # Registered first, so it runs last: the test's own teardowns may need what it set up.
+        release = _Once(lambda: prepared.__exit__(None, None, None))
+        ctx.on_cleanup(release)
+        clock["started"] = time.perf_counter()  # the measurement is the check's, not its setup
 
-    return _run_body(ctx, name, fn, result, failed, budget, cleanup_timeout_s, prepared=release)
+        def failed(exc: BaseException, **extra: Any) -> CheckResult:
+            """A runner failure graded through ``result``."""
+            graded = _runner_failure(name, group, service, exc)
+            try:
+                return result(
+                    False, graded.detail, VERDICT_ERROR, runner_fault=FAULT_RUNNER, **extra
+                )
+            except Exception:  # result() itself failed: grade without it
+                return graded
+
+        return _run_body(ctx, name, fn, result, failed, budget, cleanup_timeout_s, prepared=release)
 
 
 def _run_body(

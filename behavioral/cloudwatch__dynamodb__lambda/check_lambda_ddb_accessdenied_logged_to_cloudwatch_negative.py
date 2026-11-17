@@ -177,9 +177,9 @@ def _create_function(ctx: Any, role_arn: str, src: str, env: dict[str, str] | No
             time.sleep(2)
     ctx.on_cleanup(lambda: lam.delete_function(FunctionName=name))
     # The function auto-creates /aws/lambda/<name> on first invoke; that log group survives
-    # function deletion, so it leaks unless deleted separately (best-effort: never created if the
-    # function is never successfully invoked).
-    ctx.on_cleanup(lambda: ctx.client("logs").delete_log_group(logGroupName=f"/aws/lambda/{name}"))
+    # function deletion, so it leaks unless deleted separately (not-found is fine: it is
+    # never created if the function is never successfully invoked).
+    ctx.on_cleanup(lambda: _delete_function_log_group(ctx, f"/aws/lambda/{name}"))
     lam.get_waiter("function_active").wait(FunctionName=name, WaiterConfig={"Delay": 2, "MaxAttempts": 150})
     return name
 
@@ -237,6 +237,15 @@ def _log_tail(ctx: Any, function_name: str) -> str:
         events = logs.get_log_events(logGroupName=group, logStreamName=s["logStreamName"], limit=200)
         lines.extend(e["message"] for e in events.get("events", []))
     return "\n".join(lines)
+
+
+def _delete_function_log_group(ctx, name: str) -> None:
+    """Delete a function's log group, which exists only once the function has written a log line."""
+    logs = ctx.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=name)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
 
 
 if __name__ == "__main__":

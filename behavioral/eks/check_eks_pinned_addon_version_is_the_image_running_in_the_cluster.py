@@ -328,7 +328,7 @@ def _k8s_token(ctx, cluster_name, *, ttl_s=900):
 def _k8s(ctx, conn, method, path, *, body=None, content_type="application/json",
          timeout_s=60):
     """Request the cluster's Kubernetes API server, trusting ONLY the advertised CA."""
-    base, ca_pem = conn
+    base, ca_pem = ctx.endpoint_url(conn[0]), conn[1]
     ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ssl_ctx.check_hostname = True
     ssl_ctx.verify_mode = ssl.CERT_REQUIRED

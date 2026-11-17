@@ -3,11 +3,17 @@ from __future__ import annotations
 
 from botocore.exceptions import ClientError
 
+from botocore.config import Config
 from behavioral_harness import tags
 
 CHECK = "list-directory-buckets-rejects-regular-bucket-ops"
 GROUP = "overly-permissive"
 SERVICES = ["s3"]
+
+
+def _s3_control(ctx):
+    """S3 for a directory bucket's control calls, which AWS serves without an S3 Express session."""
+    return ctx.client("s3", config=Config(s3={"disable_s3_express_session_auth": True}))
 
 
 @tags("axis:happy-path", "cap:c1", "plane:control")
@@ -27,7 +33,7 @@ def run(ctx) -> None:
         kwargs = {"MaxDirectoryBuckets": 1000}
         if token:
             kwargs["ContinuationToken"] = token
-        resp = s3.list_directory_buckets(**kwargs)
+        resp = _s3_control(ctx).list_directory_buckets(**kwargs)
         directory_bucket_names.update(b["Name"] for b in resp.get("Buckets", []))
         token = resp.get("ContinuationToken")
         if not token:
@@ -53,7 +59,7 @@ def _create_bucket(ctx) -> str:
     kwargs: dict = {"Bucket": name}
     if ctx.region and ctx.region != "us-east-1":
         kwargs["CreateBucketConfiguration"] = {"LocationConstraint": ctx.region}
-    s3.create_bucket(**kwargs)
+    _s3_control(ctx).create_bucket(**kwargs)
     ctx.on_cleanup(lambda: _empty_and_delete_bucket(ctx, name))
     return name
 
@@ -79,7 +85,7 @@ def _create_directory_bucket(ctx) -> str:
     for az_id in az_ids:
         bucket = f"{base}--{az_id}--x-s3"
         try:
-            s3.create_bucket(
+            _s3_control(ctx).create_bucket(
                 Bucket=bucket,
                 CreateBucketConfiguration={
                     "Location": {"Type": "AvailabilityZone", "Name": az_id},
@@ -139,7 +145,7 @@ def _empty_and_delete_bucket(ctx, bucket: str) -> None:
         if exc.response["Error"]["Code"] not in ("NoSuchBucket", "NoSuchKey", "NoSuchUpload"):
             raise
     try:
-        s3.delete_bucket(Bucket=bucket)
+        _s3_control(ctx).delete_bucket(Bucket=bucket)
     except ClientError as exc:
         if exc.response["Error"]["Code"] != "NoSuchBucket":
             raise

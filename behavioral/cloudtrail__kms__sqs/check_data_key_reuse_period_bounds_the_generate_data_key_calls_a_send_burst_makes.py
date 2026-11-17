@@ -186,12 +186,24 @@ def _create_encrypted_queue(ctx, key_id, reuse_s, label):
     return url, attrs["QueueArn"], name
 
 
-def _delete_queue_quietly(sqs, url):
+def _delete_queue_quietly(sqs, url, timeout_s=40.0):
     try:
         sqs.delete_queue(QueueUrl=url)
     except ClientError as exc:
         if "NonExistentQueue" not in str(exc.response.get("Error", {}).get("Code", "")):
             raise
+        return
+    # SQS deletes the queue in the background, still using its key until it is gone.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])
+        except ClientError as exc:
+            if "NonExistentQueue" in str(exc.response.get("Error", {}).get("Code", "")):
+                return
+            raise
+        time.sleep(2)
+    raise AssertionError(f"queue {url} still exists {timeout_s}s after its delete")
 
 
 def _send_batch(sqs, url, label, batch):

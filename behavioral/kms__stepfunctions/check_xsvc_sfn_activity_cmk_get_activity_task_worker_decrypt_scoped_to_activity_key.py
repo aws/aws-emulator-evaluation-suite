@@ -56,7 +56,7 @@ def run(ctx) -> None:
         encryptionConfiguration={"type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": key_act["Arn"]},
         tags=[{"key": "sim2real", "value": CHECK[:250]}],
     )["activityArn"]
-    ctx.on_cleanup(lambda: sfn.delete_activity(activityArn=activity_arn))
+    ctx.on_cleanup(lambda: _delete_activity(sfn, activity_arn))
 
     definition = json.dumps({
         "StartAt": "Work",
@@ -214,7 +214,7 @@ def _state_machine(ctx, role_arn: str, key_sm_arn: str, definition: str) -> str:
             last = exc
             time.sleep(5.0)
             continue
-        ctx.on_cleanup(lambda a=arn: sfn.delete_state_machine(stateMachineArn=a))
+        ctx.on_cleanup(lambda a=arn: _delete_state_machine(sfn, a))
         return arn
     raise AssertionError(f"CreateStateMachine still denied after 120s: {last}")
 
@@ -345,6 +345,33 @@ def _expected_message(account: str, role_name: str, key_arn: str) -> str:
         "identity-based policy allows the kms:Decrypt action (Service: Kms, Status Code: "
         "400, Request ID: <request-id>) (SDK Attempt Count: <n>)"
     )
+
+
+def _delete_state_machine(sfn, arn: str, timeout_s: float = 300.0) -> None:
+    """Delete a state machine, then poll until DescribeStateMachine no longer finds it."""
+    sfn.delete_state_machine(stateMachineArn=arn)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            # The service deletes in the background, still using the key.
+            sfn.describe_state_machine(stateMachineArn=arn, includedData="METADATA_ONLY")
+        except sfn.exceptions.StateMachineDoesNotExist:
+            return
+        time.sleep(2.0)
+    raise AssertionError(f"state machine {arn} still exists {timeout_s}s after DeleteStateMachine")
+
+
+def _delete_activity(sfn, arn: str, timeout_s: float = 300.0) -> None:
+    """Delete an activity, then poll until DescribeActivity no longer finds it."""
+    sfn.delete_activity(activityArn=arn)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            sfn.describe_activity(activityArn=arn)
+        except sfn.exceptions.ActivityDoesNotExist:
+            return
+        time.sleep(2.0)
+    raise AssertionError(f"activity {arn} still exists {timeout_s}s after DeleteActivity")
 
 
 if __name__ == "__main__":

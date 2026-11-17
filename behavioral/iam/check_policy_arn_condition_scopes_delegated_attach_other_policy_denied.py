@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 
 from behavioral_harness import tags
@@ -138,6 +139,22 @@ def _denied_code(fn):
     raise AssertionError(f"expected AccessDenied, but the call SUCCEEDED and returned {result!r}")
 
 
+# IAM ends a denial with a pointer to a per-request authorization id, given twice (in a console URL
+# and on its own); every other character is graded.
+_AUTHZ_TAIL = (
+    r"\. Go to https://[a-z0-9-]+\.console\.aws\.amazon\.com/iam/home\?region=[a-z0-9-]+"
+    r"#/authorization-details/(\w+) for complete details, or call the "
+    r"GetRequestAuthorizationDetails API with the following authorization id: \1"
+)
+
+
+def _expected_denial(message, head):
+    """``head`` followed by the authorization-details pointer that ends ``message``: the pointer's
+    region and per-request authorization id are the only parts read back from it."""
+    found = re.search(_AUTHZ_TAIL + r"\Z", message or "")
+    return head + (found.group(0) if found else ". Go to <authorization-details pointer>")
+
+
 def _assert_stably_denied(fn, action, caller_arn, target_user, rounds=3):
     expected = (
         f"User: {caller_arn} is not authorized to perform: {action} on resource: user {target_user} "
@@ -148,7 +165,8 @@ def _assert_stably_denied(fn, action, caller_arn, target_user, rounds=3):
         assert code == "AccessDenied", (
             f"{action}: expected AccessDenied (round {i + 1}/{rounds}), got {code!r} {msg!r}"
         )
-        assert msg == expected, f"{action}: expected message {expected!r}, got {msg!r}"
+        want = _expected_denial(msg, expected)
+        assert msg == want, f"{action}: expected message {want!r}, got {msg!r}"
         time.sleep(2)
 
 

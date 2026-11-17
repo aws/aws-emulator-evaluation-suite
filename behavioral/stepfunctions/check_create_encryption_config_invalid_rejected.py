@@ -1,6 +1,8 @@
 """create-encryption-config-invalid-rejected."""
 from __future__ import annotations
 
+import time
+
 from botocore.exceptions import ClientError
 
 from behavioral_harness import tags
@@ -56,7 +58,7 @@ def run(ctx) -> None:
         encryptionConfiguration={"type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": key_arn},
         tags=tags,
     )["activityArn"]
-    ctx.on_cleanup(lambda: sfn.delete_activity(activityArn=good_arn))
+    ctx.on_cleanup(lambda: _delete_activity(sfn, good_arn))
     assert _lists_activity(sfn, good_name), (
         f"expected the positive-control activity {good_name!r} to be created and listed"
     )
@@ -75,6 +77,19 @@ def run(ctx) -> None:
     )
 
     assert not _lists_activity(sfn, bad_name), "a rejected CreateActivity must not create anything"
+
+
+def _delete_activity(sfn, arn: str, timeout_s: float = 300.0) -> None:
+    """Delete an activity, then poll until DescribeActivity no longer finds it."""
+    sfn.delete_activity(activityArn=arn)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            sfn.describe_activity(activityArn=arn)
+        except sfn.exceptions.ActivityDoesNotExist:
+            return
+        time.sleep(2.0)
+    raise AssertionError(f"activity {arn} still exists {timeout_s}s after DeleteActivity")
 
 
 if __name__ == "__main__":

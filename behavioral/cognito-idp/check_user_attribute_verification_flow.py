@@ -181,7 +181,7 @@ def run(ctx) -> None:
         UserPoolTags=resource_tags,
     )["UserPool"]
     pool_id, pool_arn = pool["Id"], pool["Arn"]
-    ctx.on_cleanup(lambda: idp.delete_user_pool(UserPoolId=pool_id))
+    ctx.on_cleanup(lambda: _delete_pool(idp, pool_id))
     lam.add_permission(
         FunctionName=function_name,
         StatementId="cognito-idp-invoke",
@@ -631,6 +631,19 @@ class _CodeInbox:
             f"no {trigger_sources!r} code for {username!r} reached the trigger's queue within the "
             f"shared check deadline; deliveries seen but unmatched: {self.seen!r}"
         )
+
+
+def _delete_pool(idp, pool_id: str, timeout_s: float = 60.0) -> None:
+    """Delete the pool and wait until it reads as gone, so its KMS key is retired after it."""
+    idp.delete_user_pool(UserPoolId=pool_id)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:  # the pool deletes in the background
+        try:
+            idp.describe_user_pool(UserPoolId=pool_id)
+        except idp.exceptions.ResourceNotFoundException:
+            return
+        time.sleep(2.0)
+    raise AssertionError(f"user pool {pool_id} still present {timeout_s}s after its delete")
 
 
 def _safe_delete_role_policy(iam, role_name, policy_name):

@@ -113,7 +113,7 @@ def _retry_on_code(fn, code: str, *, attempts: int = 5, delay_s: float = 2.0):
     raise last_exc
 
 
-def _safe_disassociate(logs, group_name: str) -> None:
+def _safe_disassociate(logs, group_name: str, timeout_s: float = 30.0) -> None:
     from botocore.exceptions import ClientError
 
     try:
@@ -121,6 +121,14 @@ def _safe_disassociate(logs, group_name: str) -> None:
     except ClientError as exc:
         if exc.response["Error"]["Code"] != "ResourceNotFoundException":
             raise
+    # Wait until the group no longer uses the key: the key's teardown runs next.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        found = logs.describe_log_groups(logGroupNamePrefix=group_name)["logGroups"]
+        if not any(g["logGroupName"] == group_name and "kmsKeyId" in g for g in found):
+            return
+        time.sleep(2)
+    raise AssertionError(f"log group {group_name} still has a KMS key after {timeout_s}s")
 
 
 if __name__ == "__main__":

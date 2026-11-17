@@ -33,7 +33,7 @@ def run(ctx) -> None:
     topic_arn = sns.create_topic(Name=ctx.unique_name("sim2real-behav-sns-kmspend-"),
                                  Attributes={"KmsMasterKeyId": key_id},
                                  Tags=[{"Key": "sim2real", "Value": CHECK}])["TopicArn"]
-    ctx.on_cleanup(lambda: sns.delete_topic(TopicArn=topic_arn))
+    ctx.on_cleanup(lambda: _delete_topic(sns, topic_arn))
 
     assert sns.publish(TopicArn=topic_arn, Message="sim2real-before")["MessageId"], (
         "control: Publish must succeed while the key is Enabled")
@@ -49,7 +49,7 @@ def run(ctx) -> None:
     )
 
     kms.cancel_key_deletion(KeyId=key_id)
-    state = kms.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"]
+    state = _state_after_pending_deletion(kms, key_id)
     assert state == "Disabled", f"a key whose deletion was cancelled must be Disabled, got {state!r}"
     code, message = _refusal_once_settled(sns, topic_arn, "KMSDisabled")
     expected = _relayed(f"{key_arn} is disabled.", "DisabledException", message)
@@ -69,6 +69,30 @@ def run(ctx) -> None:
                 raise
             time.sleep(2)
     assert mid, "Publish must succeed again once the key is re-enabled"
+
+
+def _state_after_pending_deletion(kms, key_id: str, timeout_s: float = 30.0) -> str:
+    """The key's state once DescribeKey stops reporting PendingDeletion, bounded by timeout_s;
+    CancelKeyDeletion reaches DescribeKey asynchronously."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        state = kms.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"]
+        if state != "PendingDeletion" or time.monotonic() > deadline:
+            return state
+        time.sleep(1)
+
+
+def _delete_topic(sns, topic_arn: str, timeout_s: float = 60.0) -> None:
+    """Delete the topic and poll GetTopicAttributes until it is NotFound."""
+    sns.delete_topic(TopicArn=topic_arn)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:  # the topic deletes in the background
+        try:
+            sns.get_topic_attributes(TopicArn=topic_arn)
+        except sns.exceptions.NotFoundException:
+            return
+        time.sleep(2)
+    raise AssertionError(f"topic {topic_arn} still present {timeout_s}s after its delete")
 
 
 def _schedule_deletion(kms, key_id: str) -> None:

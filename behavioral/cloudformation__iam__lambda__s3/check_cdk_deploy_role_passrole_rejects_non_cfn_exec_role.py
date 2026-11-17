@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -166,7 +167,7 @@ def run(ctx) -> None:
             f"User: {deploy_session} is not authorized to perform: iam:CreateRole on resource: "
             f"arn:aws:iam::{acct}:role/{decoy_role}-escalated because no identity-based policy "
             f"allows the iam:CreateRole action",
-            "the deploy role holds iam:PassRole and no other iam action")
+            "the deploy role holds iam:PassRole and no other iam action", iam_api=True)
         _expect(lambda: iam.get_role(RoleName=decoy_role + "-escalated"), "NoSuchEntity",
                 f"The role with name {decoy_role}-escalated cannot be found.",
                 f"effect-absent: role {decoy_role + '-escalated'!r} exists after the refused "
@@ -273,12 +274,32 @@ _CFN_TRUST = {
 }
 
 
-def _expect(fn, code: str, message: str, why: str) -> None:
-    """Assert fn() is refused with exactly this code and message; raise if the call succeeds."""
+# IAM ends a denial with a pointer to a per-request authorization id, given twice (in a console URL
+# and on its own); every other character is graded.
+_AUTHZ_TAIL = (
+    r"\. Go to https://[a-z0-9-]+\.console\.aws\.amazon\.com/iam/home\?region=[a-z0-9-]+"
+    r"#/authorization-details/(\w+) for complete details, or call the "
+    r"GetRequestAuthorizationDetails API with the following authorization id: \1"
+)
+
+
+def _expected_denial(message, head):
+    """``head`` followed by the authorization-details pointer that ends ``message``: the pointer's
+    region and per-request authorization id are the only parts read back from it."""
+    found = re.search(_AUTHZ_TAIL + r"\Z", message or "")
+    return head + (found.group(0) if found else ". Go to <authorization-details pointer>")
+
+
+def _expect(fn, code: str, message: str, why: str, *, iam_api: bool = False) -> None:
+    """Assert fn() is refused with exactly this code and message; raise if the call succeeds.
+
+    An ``iam_api`` refusal ends with IAM's authorization-details pointer, graded as well."""
     try:
         fn()
     except ClientError as exc:
         got = (str(exc.response["Error"]["Code"]), str(exc.response["Error"].get("Message", "")))
+        if iam_api:
+            message = _expected_denial(got[1], message)
         assert got == (code, message), f"{why}: expected {(code, message)!r}, got {got!r}"
         return
     raise AssertionError(f"{why}: the call succeeded but was expected to be refused")

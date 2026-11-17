@@ -74,6 +74,19 @@ def _empty_and_delete(s3, bucket):
             ) from exc
 
 
+def _delete_rule_set(ses, rule_set, timeout_s=30.0):
+    """Delete the receipt rule set and confirm it reads as gone, so its key is retired after it."""
+    ses.delete_receipt_rule_set(RuleSetName=rule_set)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            ses.describe_receipt_rule_set(RuleSetName=rule_set)
+        except ses.exceptions.RuleSetDoesNotExistException:
+            return
+        time.sleep(2.0)
+    raise AssertionError(f"receipt rule set {rule_set} still present {timeout_s}s after its delete")
+
+
 def _retire_key(kms, key_id):
     """Re-enable then schedule deletion, so a mid-check failure never leaves a disabled key.
 
@@ -176,7 +189,7 @@ def run(ctx) -> None:
 
     rule_set = ctx.unique_name("sim2real-ses-kms-")
     ses.create_receipt_rule_set(RuleSetName=rule_set)
-    ctx.on_cleanup(lambda: ses.delete_receipt_rule_set(RuleSetName=rule_set))
+    ctx.on_cleanup(lambda: _delete_rule_set(ses, rule_set))
 
     grant_wait_s = _budget_s(ctx, 180.0)
     deadline = time.monotonic() + grant_wait_s

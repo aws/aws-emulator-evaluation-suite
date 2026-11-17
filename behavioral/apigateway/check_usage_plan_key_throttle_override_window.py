@@ -40,7 +40,7 @@ def run(ctx) -> None:
         throttle={"rateLimit": plan_rate, "burstLimit": plan_burst},
         tags={"sim2real": "usage-plan-key-throttle-override-window"},
     )["id"]
-    ctx.on_cleanup(lambda: apigw.delete_usage_plan(usagePlanId=plan_id))
+    ctx.on_cleanup(lambda: _detach_and_delete_usage_plan(apigw, plan_id, api_id, stage_name))
 
     key_id = apigw.create_api_key(
         name=ctx.unique_name("sim2real-key-"),
@@ -97,6 +97,15 @@ def _root_resource_id(apigw, api_id: str) -> str:
         if item["path"] == "/":
             return item["id"]
     raise AssertionError("root resource not found")
+
+
+def _detach_and_delete_usage_plan(apigw, plan_id: str, api_id: str, stage: str) -> None:
+    """Detach the plan's API stage, then delete the plan, which AWS refuses while it has one."""
+    apigw.update_usage_plan(
+        usagePlanId=plan_id,
+        patchOperations=[{"op": "remove", "path": "/apiStages", "value": f"{api_id}:{stage}"}],
+    )
+    apigw.delete_usage_plan(usagePlanId=plan_id)
 
 
 if __name__ == "__main__":

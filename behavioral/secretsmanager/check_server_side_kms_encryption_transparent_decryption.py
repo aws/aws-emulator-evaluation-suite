@@ -18,6 +18,21 @@ def _budget_s(ctx, cap_s: float) -> float:
     return cap_s if left is None else max(1.0, min(cap_s, left - 5.0))
 
 
+def _force_delete_until_gone(sm, secret_id, timeout_s=30.0):
+    sm.delete_secret(SecretId=secret_id, ForceDeleteWithoutRecovery=True)
+    # Secrets Manager deletes the secret in the background, still using its key until it is gone.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            sm.describe_secret(SecretId=secret_id)
+        except botocore.exceptions.ClientError as exc:
+            if exc.response["Error"]["Code"] == "ResourceNotFoundException":
+                return
+            raise
+        time.sleep(2)
+    raise AssertionError(f"secret {secret_id} still exists {timeout_s}s after its delete")
+
+
 @tags(
     "axis:happy-path",
     "cap:c2",
@@ -45,7 +60,7 @@ def run(ctx) -> None:
     name = ctx.unique_name("sim2real-behav-smkms-")
     original_value = "kms-round-trip-value-v1"
     sm.create_secret(Name=name, SecretString=original_value, KmsKeyId=key_arn)
-    ctx.on_cleanup(lambda: sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True))
+    ctx.on_cleanup(lambda: _force_delete_until_gone(sm, name))
 
     description = sm.describe_secret(SecretId=name)
     assert description["KmsKeyId"] == key_arn, (

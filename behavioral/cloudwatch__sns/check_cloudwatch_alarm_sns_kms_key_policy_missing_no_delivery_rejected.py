@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import time
 
+from botocore.exceptions import ClientError
+
 from behavioral_harness import tags
 
 CHECK = "cloudwatch-alarm-sns-kms-key-policy-missing-no-delivery-rejected"
@@ -143,7 +145,7 @@ def _create_topic(ctx, kms_key_id: str) -> str:
         Attributes={"KmsMasterKeyId": kms_key_id},
         Tags=[{"Key": "sim2real", "Value": CHECK}],
     )["TopicArn"]
-    ctx.on_cleanup(lambda: sns.delete_topic(TopicArn=arn))
+    ctx.on_cleanup(lambda: _delete_topic_and_wait(sns, arn))
     return arn
 
 
@@ -220,6 +222,21 @@ def _drain_for(ctx, queue_url: str, *, timeout_s: float, interval_s: float = 3.0
             out.append(payload)
         time.sleep(interval_s)
     return out
+
+
+def _delete_topic_and_wait(sns, arn: str, timeout_s: float = 30.0) -> None:
+    sns.delete_topic(TopicArn=arn)
+    # Wait until the topic is gone: the key's teardown runs next.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            sns.get_topic_attributes(TopicArn=arn)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "NotFound":
+                return
+            raise
+        time.sleep(2)
+    raise AssertionError(f"topic {arn} still present after {timeout_s}s")
 
 
 if __name__ == "__main__":

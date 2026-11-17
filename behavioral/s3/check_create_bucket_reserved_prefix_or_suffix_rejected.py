@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from botocore.exceptions import ClientError, EndpointResolutionError
 
+from botocore.config import Config
 from behavioral_harness import tags
 
 CHECK = "create-bucket-reserved-prefix-or-suffix-rejected"
@@ -15,6 +16,11 @@ _NOT_VALID = "The specified bucket is not valid."
 _MALFORMED_XML = (
     "The XML you provided was not well-formed or did not validate against our published schema"
 )
+
+
+def _s3_control(ctx):
+    """S3 for a directory bucket's control calls, which AWS serves without an S3 Express session."""
+    return ctx.client("s3", config=Config(s3={"disable_s3_express_session_auth": True}))
 
 
 def _error(fn):
@@ -55,21 +61,21 @@ def _bucket_params(ctx, name: str) -> dict:
 def _assert_invalid_name(ctx, s3, name: str, reason: str) -> None:
     # Only does anything if the create below unexpectedly lands.
     ctx.on_cleanup(lambda: _delete_bucket(s3, name))
-    code, message = _error(lambda: s3.create_bucket(**_bucket_params(ctx, name)))
+    code, message = _error(lambda: _s3_control(ctx).create_bucket(**_bucket_params(ctx, name)))
     assert code == "InvalidBucketName", f"{reason}: expected InvalidBucketName, got {code!r} ({message!r})"
     assert message == _NOT_VALID, f"{reason}: expected the exact message, got {message!r}"
 
 
 def _assert_reserved_prefix(ctx, s3, name: str, reason: str) -> None:
     ctx.on_cleanup(lambda: _delete_bucket(s3, name))
-    code, message = _error(lambda: s3.create_bucket(**_bucket_params(ctx, name)))
+    code, message = _error(lambda: _s3_control(ctx).create_bucket(**_bucket_params(ctx, name)))
     assert code == "AccessDenied", f"{reason}: expected AccessDenied, got {code!r} ({message!r})"
     assert message == _STARTS_RESERVED, f"{reason}: expected the exact message, got {message!r}"
 
 
 def _assert_reserved_suffix(ctx, s3, name: str, reason: str) -> None:
     ctx.on_cleanup(lambda: _delete_bucket(s3, name))
-    code, message = _error(lambda: s3.create_bucket(**_bucket_params(ctx, name)))
+    code, message = _error(lambda: _s3_control(ctx).create_bucket(**_bucket_params(ctx, name)))
     assert code == "AccessDenied", f"{reason}: expected AccessDenied, got {code!r} ({message!r})"
     assert message == _ENDS_RESERVED, f"{reason}: expected the exact message, got {message!r}"
 
@@ -79,7 +85,7 @@ def _assert_malformed_xml(ctx, s3, name: str, reason: str) -> None:
     # The general-purpose body is sent in every region, us-east-1 included, so the request shape
     # does not depend on the region.
     params = {"Bucket": name, "CreateBucketConfiguration": {"LocationConstraint": ctx.region}}
-    code, message = _error(lambda: s3.create_bucket(**params))
+    code, message = _error(lambda: _s3_control(ctx).create_bucket(**params))
     assert code == "MalformedXML", f"{reason}: expected MalformedXML, got {code!r} ({message!r})"
     assert message == _MALFORMED_XML, f"{reason}: expected the exact message, got {message!r}"
 
@@ -95,9 +101,9 @@ def run(ctx) -> None:
     s3 = ctx.client("s3")
 
     base = ctx.unique_name("sim2real-behav-s3rsv-")
-    s3.create_bucket(**_bucket_params(ctx, base))
+    _s3_control(ctx).create_bucket(**_bucket_params(ctx, base))
     ctx.on_cleanup(lambda: _delete_bucket(s3, base))
-    s3.put_bucket_tagging(Bucket=base, Tagging={"TagSet": [{"Key": "sim2real", "Value": CHECK}]})
+    _s3_control(ctx).put_bucket_tagging(Bucket=base, Tagging={"TagSet": [{"Key": "sim2real", "Value": CHECK}]})
     s3.head_bucket(Bucket=base)  # independent read: the control bucket really exists
 
     # The xn-- prefix, and a leading or trailing hyphen, read as a structurally invalid name.

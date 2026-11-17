@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from botocore.exceptions import ClientError
+from botocore.config import Config
 from behavioral_harness import tags
 
 
@@ -22,6 +23,11 @@ EXPRESS_ZONE_IDS = {
     "eu-west-1": "euw1-az1",
     "eu-north-1": "eun1-az1",
 }
+
+
+def _s3_control(ctx):
+    """S3 for a directory bucket's control calls, which AWS serves without an S3 Express session."""
+    return ctx.client("s3", config=Config(s3={"disable_s3_express_session_auth": True}))
 
 
 def _delete_directory_bucket(client, bucket):
@@ -66,7 +72,7 @@ def _new_directory_bucket(ctx, s3):
         raise AssertionError(f"no known S3 Express One Zone Availability Zone for region {ctx.region!r}")
     name = f"{ctx.unique_name('sim2real-dir-')}--{zone_id}--x-s3"
     try:
-        s3.create_bucket(
+        _s3_control(ctx).create_bucket(
             Bucket=name,
             CreateBucketConfiguration={
                 "Location": {"Type": "AvailabilityZone", "Name": zone_id},

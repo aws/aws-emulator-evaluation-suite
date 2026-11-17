@@ -98,6 +98,7 @@ def run(ctx) -> None:
         Tags=[{"TagKey": "sim2real", "TagValue": "update-object-encryption-error-preconditions"}],
     )["KeyMetadata"]["Arn"]
     ctx.on_cleanup(lambda: kms.schedule_key_deletion(KeyId=denied_key_id, PendingWindowInDays=7))
+    ctx.on_cleanup(lambda: _delete_object(s3, bucket, key))  # the object goes before its key
 
     # KMS key policies are eventually consistent; wait until the deny is enforced.
     _wait_for_deny_effective(kms, denied_key_id)
@@ -170,6 +171,7 @@ def run(ctx) -> None:
         Tags=[{"TagKey": "sim2real", "TagValue": "update-object-encryption-error-preconditions"}],
     )["KeyMetadata"]["Arn"]
     ctx.on_cleanup(lambda: kms.schedule_key_deletion(KeyId=allowed_key_id, PendingWindowInDays=7))
+    ctx.on_cleanup(lambda: _delete_object(s3, bucket, key))  # the object goes before its key
 
     s3.update_object_encryption(Bucket=bucket, Key=key, ObjectEncryption={"SSEKMS": {"KMSKeyArn": allowed_key_id}})
     updated_head = s3.head_object(Bucket=bucket, Key=key)
@@ -261,6 +263,21 @@ def _wait_for_deny_lifted(kms, key_id: str, timeout: float = 90.0, interval: flo
                 f"(generate_data_key_allowed={generate_data_key_allowed}, encrypt_allowed={encrypt_allowed})"
             )
         time.sleep(interval)
+
+
+def _delete_object(s3, bucket, key, timeout_s=20.0):
+    """Delete the object and confirm it reads as gone, so its KMS key is retired after it."""
+    s3.delete_object(Bucket=bucket, Key=key)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            s3.head_object(Bucket=bucket, Key=key)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound", "NoSuchBucket"):
+                return
+            raise
+        time.sleep(2.0)
+    raise AssertionError(f"object {key} in {bucket} still present {timeout_s}s after its delete")
 
 
 def _create_bucket(s3, bucket: str, region: str) -> None:

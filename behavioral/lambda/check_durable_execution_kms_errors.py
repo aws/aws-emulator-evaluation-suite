@@ -200,7 +200,7 @@ def run(ctx) -> None:
                 raise
         if not created:
             raise last_exc
-        ctx.on_cleanup(lambda: lam.delete_function(FunctionName=fn))
+        ctx.on_cleanup(lambda: _delete_function(lam, fn))
     except Exception as exc:  # noqa: BLE001
         raise AssertionError(f"durable functions (with a customer KMS key) not usable here: {exc}") from None
 
@@ -307,6 +307,19 @@ def run(ctx) -> None:
     assert stop_code is None or stop_code in kms_codes + ("ResourceConflictException", "InvalidParameterValueException"), (
         f"StopDurableExecution: expected success or a KMS-family/conflict error, got {stop_code}"
     )
+
+
+def _delete_function(lam, function_name: str, timeout_s: float = 600.0) -> None:
+    """Delete the function and wait until it reads as gone, so its KMS key is retired after it."""
+    lam.delete_function(FunctionName=function_name)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:  # the function deletes in the background
+        try:
+            lam.get_function(FunctionName=function_name)
+        except lam.exceptions.ResourceNotFoundException:
+            return
+        time.sleep(2.0)
+    raise AssertionError(f"function {function_name} still present {timeout_s}s after its delete")
 
 
 def _delete_lambda_log_group(ctx, function_name: str) -> None:

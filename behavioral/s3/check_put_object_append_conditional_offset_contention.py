@@ -3,12 +3,18 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 
+from botocore.config import Config
 from behavioral_harness import tags
 from botocore.exceptions import ClientError
 
 CHECK = "put-object-append-conditional-offset-contention"
 GROUP = "concurrency"
 SERVICES = ["s3"]
+
+
+def _s3_control(ctx):
+    """S3 for a directory bucket's control calls, which AWS serves without an S3 Express session."""
+    return ctx.client("s3", config=Config(s3={"disable_s3_express_session_auth": True}))
 
 
 @tags("axis:rejection", "cap:c2", "concern:data-plane", "concern:negative-classes", "dp:api", "plane:data")
@@ -96,7 +102,7 @@ def _create_directory_bucket_or_skip(ctx) -> str:
     for zone_id in zone_ids:
         bucket = f"{base}--{zone_id}--x-s3"
         try:
-            s3.create_bucket(
+            _s3_control(ctx).create_bucket(
                 Bucket=bucket,
                 CreateBucketConfiguration={
                     "Location": {"Type": "AvailabilityZone", "Name": zone_id},
@@ -132,7 +138,7 @@ def _delete_directory_bucket(ctx, bucket: str) -> None:
         if exc.response["Error"]["Code"] not in ("NoSuchBucket", "NoSuchKey", "NoSuchUpload"):
             raise
     try:
-        s3.delete_bucket(Bucket=bucket)
+        _s3_control(ctx).delete_bucket(Bucket=bucket)
     except ClientError as exc:
         if exc.response["Error"]["Code"] != "NoSuchBucket":
             raise

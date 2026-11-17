@@ -67,7 +67,7 @@ def run(ctx) -> None:
     )
     secret_arn = created["ARN"]
     original_version = created["VersionId"]
-    ctx.on_cleanup(lambda: sm.delete_secret(SecretId=secret_arn, ForceDeleteWithoutRecovery=True))
+    ctx.on_cleanup(lambda: _force_delete_until_gone(sm, secret_arn))
 
     iam.put_role_policy(
         RoleName=role_name,
@@ -141,6 +141,21 @@ def run(ctx) -> None:
         description="the role's read to converge on its own write",
     )
     assert reread == ("ok", "written-by-role"), f"the role must read its own write; got {reread!r}"
+
+
+def _force_delete_until_gone(sm, secret_id, timeout_s=30.0):
+    sm.delete_secret(SecretId=secret_id, ForceDeleteWithoutRecovery=True)
+    # Secrets Manager deletes the secret in the background, still using its key until it is gone.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            sm.describe_secret(SecretId=secret_id)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ResourceNotFoundException":
+                return
+            raise
+        time.sleep(2)
+    raise AssertionError(f"secret {secret_id} still exists {timeout_s}s after its delete")
 
 
 def _create_role(ctx, iam, account_id, role_name):

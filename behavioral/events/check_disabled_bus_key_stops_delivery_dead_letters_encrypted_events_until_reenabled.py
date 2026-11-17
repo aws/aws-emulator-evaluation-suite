@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import time
 
+from botocore.exceptions import ClientError
+
 
 from behavioral_harness import tags
 
@@ -25,6 +27,8 @@ _DISABLED_PUTS = 4
 _DRAIN_TIMEOUT_S = 90.0
 _RECOVERY_TIMEOUT_S = 240.0
 _PUT_INTERVAL_S = 2.0
+_QUIET_PROBES = 3
+_PROBE_WAIT_S = 15.0
 # The two dead-letter reasons a disabled key produced, each with the message AWS pairs it with.
 _DEAD_LETTER_REASONS = {
     "RULE_DECRYPTION_FAILURE": "Unable to decrypt rule using the Kms key.",
@@ -49,7 +53,7 @@ def run(ctx) -> None:
 
     events.create_event_bus(Name=bus, KmsKeyIdentifier=key_arn, DeadLetterConfig={"Arn": dlq_arn},
                             Tags=[{"Key": "sim2real", "Value": CHECK}])
-    ctx.on_cleanup(lambda: events.delete_event_bus(Name=bus))
+    ctx.on_cleanup(lambda: _delete_bus_and_wait(events, bus))
 
     source = ctx.unique_name("sim2real.cmkoff.")
     rule = ctx.unique_name("sim2real-behav-rule-")
@@ -105,6 +109,20 @@ def run(ctx) -> None:
         time.sleep(min(_PUT_INTERVAL_S, max(0.0, settle_until - time.monotonic())))
     dead += _drain(sqs, dlq_url)
     _drain(sqs, target_url)  # deliveries from before the disable took effect are not graded
+    # Then put probes until several in a row do not reach the target, bounded, so the graded
+    # events below are put once the disable has taken effect on the delivery path.
+    quiet, quiet_until = 0, time.monotonic() + _SETTLE_TIMEOUT_S
+    while quiet < _QUIET_PROBES and time.monotonic() < quiet_until:
+        n += 1
+        entry = publish("settling", n)
+        if "EventId" in entry and entry["EventId"] in _wait_for_ids(
+            sqs, target_url, {entry["EventId"]}, _PROBE_WAIT_S
+        ):
+            quiet = 0
+        else:
+            quiet += 1
+            time.sleep(_PUT_INTERVAL_S)
+    dead += _drain(sqs, dlq_url)
 
     disabled_ids = set()
     for m in range(1, _DISABLED_PUTS + 1):
@@ -207,6 +225,21 @@ def _wait_for_ids(sqs, url: str, ids: set, timeout_s: float) -> set:
             seen.add(json.loads(m["Body"]).get("id"))
             sqs.delete_message(QueueUrl=url, ReceiptHandle=m["ReceiptHandle"])
     return seen
+
+
+def _delete_bus_and_wait(events, bus: str, timeout_s: float = 30.0) -> None:
+    events.delete_event_bus(Name=bus)
+    # Wait until the bus is gone: the key's teardown runs next.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            events.describe_event_bus(Name=bus)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ResourceNotFoundException":
+                return
+            raise
+        time.sleep(2)
+    raise AssertionError(f"event bus {bus} still present after {timeout_s}s")
 
 
 if __name__ == "__main__":

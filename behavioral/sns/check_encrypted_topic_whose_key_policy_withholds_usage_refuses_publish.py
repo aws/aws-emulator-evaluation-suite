@@ -109,11 +109,26 @@ def _create_key(ctx, statements: list[dict]) -> str:
     return key_id
 
 
+def _delete_topic_until_gone(sns, arn: str, timeout_s: float = 30.0) -> None:
+    sns.delete_topic(TopicArn=arn)
+    # Wait until the topic no longer resolves: the key's teardown runs after it.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            sns.get_topic_attributes(TopicArn=arn)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "NotFound":
+                return
+            raise
+        time.sleep(2)
+    raise AssertionError(f"topic {arn} still exists {timeout_s}s after its delete")
+
+
 def _create_topic(ctx, prefix: str, key_id: str) -> str:
     sns = ctx.client("sns")
     arn = sns.create_topic(Name=ctx.unique_name(prefix), Attributes={"KmsMasterKeyId": key_id},
                            Tags=[{"Key": "sim2real", "Value": CHECK}])["TopicArn"]
-    ctx.on_cleanup(lambda: sns.delete_topic(TopicArn=arn))
+    ctx.on_cleanup(lambda: _delete_topic_until_gone(sns, arn))
     return arn
 
 

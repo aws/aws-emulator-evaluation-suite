@@ -450,9 +450,7 @@ def _create_function_with_retry(
             resp = lam.create_function(**kwargs)
             ctx.on_cleanup(lambda: lam.delete_function(FunctionName=name))
             ctx.on_cleanup(
-                lambda: ctx.client("logs").delete_log_group(
-                    logGroupName=f"/aws/lambda/{name}"
-                )
+                lambda: _delete_function_log_group(ctx, f"/aws/lambda/{name}")
             )
             _wait_function_active(ctx, name)
             return {"name": name, "arn": resp["FunctionArn"]}
@@ -564,6 +562,15 @@ def _alnum_name(ctx, kind):
     unique name to alphanumerics. Safe for leaks: all three cascade away with the parent
     RestApi, which IS registered for teardown under the sim2real-xsvc- prefix."""
     return re.sub(r"[^A-Za-z0-9]", "", f"sim2realxsvc{kind}{ctx.unique_name('')}")[:60]
+
+
+def _delete_function_log_group(ctx, name: str) -> None:
+    """Delete a function's log group, which exists only once the function has written a log line."""
+    logs = ctx.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=name)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
 
 
 if __name__ == "__main__":

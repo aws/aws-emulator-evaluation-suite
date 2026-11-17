@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 from botocore.exceptions import ClientError
@@ -33,6 +34,7 @@ def run(ctx) -> None:
         Name=name, KmsKey=key_arn, SourceURI=f"s3://{bucket}"
     )
     identifier = created["Id"]
+    ctx.on_cleanup(lambda: _try_delete_data_integration(appi, identifier))
     appi.delete_data_integration(DataIntegrationIdentifier=identifier)
 
     deleted_expected = f"Could not find DataIntegration with identifier: {identifier}."
@@ -117,6 +119,25 @@ def _create_kms_key_for_appintegrations(ctx: Any) -> str:
 
     ctx.on_cleanup(_cleanup)
     return key["Arn"]
+
+
+def _try_delete_data_integration(appi: Any, identifier: str, timeout_s: float = 60.0) -> None:
+    try:
+        appi.delete_data_integration(DataIntegrationIdentifier=identifier)
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ResourceNotFoundException":
+            raise
+    # Wait until it is gone: the key's teardown runs next and the service may still be deleting.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            appi.get_data_integration(Identifier=identifier)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ResourceNotFoundException":
+                return
+            raise
+        time.sleep(2)
+    raise AssertionError(f"data integration {identifier} still present after {timeout_s}s")
 
 
 if __name__ == "__main__":

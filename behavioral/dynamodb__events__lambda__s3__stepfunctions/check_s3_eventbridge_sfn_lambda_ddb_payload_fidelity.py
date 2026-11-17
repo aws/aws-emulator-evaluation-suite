@@ -342,9 +342,7 @@ def _create_function_with_retry(
             # The function creates /aws/lambda/<name> on first invoke and that log group outlives
             # the function, so delete it too.
             ctx.on_cleanup(
-                lambda: ctx.client("logs").delete_log_group(
-                    logGroupName=f"/aws/lambda/{name}"
-                )
+                lambda: _delete_function_log_group(ctx, f"/aws/lambda/{name}")
             )
             _wait_function_active(ctx, name)
             return {"name": name, "arn": resp["FunctionArn"]}
@@ -519,11 +517,11 @@ def _create_state_machine(ctx, definition, permissions=None) -> dict[str, str]:
 
 
 def _stop_and_delete_state_machine(ctx, arn: str) -> None:
-    """Delete a Step Functions state machine and wait until it is gone.
+    """Delete a Step Functions state machine and wait until it reports DELETING or is gone.
 
-    SFN deletion is asynchronous, and a state machine with a RUNNING execution lingers in
-    DELETING, so running executions are stopped first. A state machine or execution already gone
-    is fine; any other error, or the state machine still present after 90 s, raises.
+    SFN deletion is asynchronous, and a machine with a RUNNING execution does not finish
+    deleting until the execution stops, so running executions are stopped first. A machine or
+    execution already gone is fine; any other error, or a machine not DELETING after 90 s, raises.
     """
     sfn = ctx.client("stepfunctions")
     try:
@@ -543,14 +541,24 @@ def _stop_and_delete_state_machine(ctx, arn: str) -> None:
     deadline = time.monotonic() + 90
     while True:
         try:
-            sfn.describe_state_machine(stateMachineArn=arn)
+            if sfn.describe_state_machine(stateMachineArn=arn)["status"] == "DELETING":
+                return
         except ClientError as exc:
             if exc.response["Error"]["Code"] != "StateMachineDoesNotExist":
                 raise
             return
         if time.monotonic() >= deadline:
-            raise AssertionError(f"state machine {arn} still present 90 s after DeleteStateMachine")
+            raise AssertionError(f"state machine {arn} still ACTIVE 90 s after DeleteStateMachine")
         time.sleep(2)
+
+
+def _delete_function_log_group(ctx, name: str) -> None:
+    """Delete a function's log group, which exists only once the function has written a log line."""
+    logs = ctx.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=name)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
 
 
 if __name__ == "__main__":

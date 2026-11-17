@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 
 from behavioral_harness import tags
@@ -65,9 +66,9 @@ def run(ctx) -> None:
     for label, fn in allowed.items():
         _until_allowed(fn, timeout_s=60, label=label)
 
-    # The ListRoles and ListServerCertificates denials name the account-level resource and
-    # carry a fixed text. The ListAccountAliases and TagUser denials append a per-request
-    # authorization id, so for those the message varies and only the code and action are graded.
+    # The ListRoles and ListServerCertificates denials name the account-level resource and are
+    # graded whole, with the authorization-details pointer IAM appends. For the ListAccountAliases
+    # and TagUser denials only the code and action are graded.
     def _implicit_deny(action, resource):
         return (
             f"User: {user_arn} is not authorized to perform: {action} on resource: {resource} "
@@ -132,10 +133,26 @@ def _denied_code(fn):
     return "<allowed>", ""
 
 
+# IAM ends a denial with a pointer to a per-request authorization id, given twice (in a console URL
+# and on its own); every other character is graded.
+_AUTHZ_TAIL = (
+    r"\. Go to https://[a-z0-9-]+\.console\.aws\.amazon\.com/iam/home\?region=[a-z0-9-]+"
+    r"#/authorization-details/(\w+) for complete details, or call the "
+    r"GetRequestAuthorizationDetails API with the following authorization id: \1"
+)
+
+
+def _expected_denial(message, head):
+    """``head`` followed by the authorization-details pointer that ends ``message``: the pointer's
+    region and per-request authorization id are the only parts read back from it."""
+    found = re.search(_AUTHZ_TAIL + r"\Z", message or "")
+    return head + (found.group(0) if found else ". Go to <authorization-details pointer>")
+
+
 def _assert_stably_denied(fn, action, expected=None, rounds=3):
     """Assert AccessDenied over several rounds; ``expected`` is the exact message or None.
 
-    None where the message carries a per-request authorization id; then only the action is graded.
+    None where only the action is graded.
     """
     for i in range(rounds):
         code, msg = _denied_code(fn)
@@ -143,9 +160,9 @@ def _assert_stably_denied(fn, action, expected=None, rounds=3):
             f"{action}: expected AccessDenied (round {i + 1}/{rounds}), got {code!r} {msg!r}"
         )
         if expected is not None:
-            assert msg == expected, f"{action}: denial message {msg!r}"
+            assert msg == _expected_denial(msg, expected), f"{action}: denial message {msg!r}"
         else:
-            # message varies: per-request authorization id
+            # the named action is graded
             assert f"perform: {action}" in msg, f"{action}: denial message names another action: {msg!r}"
         time.sleep(2)
 

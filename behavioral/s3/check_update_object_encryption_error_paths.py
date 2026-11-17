@@ -1,6 +1,8 @@
 """update-object-encryption-error-paths."""
 from __future__ import annotations
 
+import time
+
 from botocore.exceptions import ClientError
 
 from behavioral_harness import tags
@@ -29,6 +31,7 @@ def run(ctx) -> None:
         "KeyMetadata"
     ]["Arn"]
     ctx.on_cleanup(lambda: kms.schedule_key_deletion(KeyId=kms_key_arn, PendingWindowInDays=7))
+    ctx.on_cleanup(lambda: _delete_object(s3, bucket, key))  # the object goes before its key
     s3.update_object_encryption(Bucket=bucket, Key=key, ObjectEncryption={"SSEKMS": {"KMSKeyArn": kms_key_arn}})
     control_head = s3.head_object(Bucket=bucket, Key=key)
     assert control_head.get("ServerSideEncryption") == "aws:kms", (
@@ -131,6 +134,21 @@ def _create_bucket(ctx):
 
     ctx.on_cleanup(_cleanup)
     return name
+
+
+def _delete_object(s3, bucket, key, timeout_s=20.0):
+    """Delete the object and confirm it reads as gone, so its KMS key is retired after it."""
+    s3.delete_object(Bucket=bucket, Key=key)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            s3.head_object(Bucket=bucket, Key=key)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound", "NoSuchBucket"):
+                return
+            raise
+        time.sleep(2.0)
+    raise AssertionError(f"object {key} in {bucket} still present {timeout_s}s after its delete")
 
 
 def _error(fn):

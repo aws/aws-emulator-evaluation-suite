@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 
 from botocore.exceptions import ClientError
@@ -13,6 +14,23 @@ GROUP = 'overly-permissive'
 SERVICES = ['sts']
 # What an error-code helper returns when the call succeeds: equal to no AWS error code.
 _OK = "(no error: the call succeeded)"
+
+
+# IAM ends a denial with a pointer to a per-request authorization id, given twice (in a console URL
+# and on its own); every other character is graded.
+_AUTHZ_TAIL = (
+    r"\. Go to https://[a-z0-9-]+\.console\.aws\.amazon\.com/iam/home\?region=[a-z0-9-]+"
+    r"#/authorization-details/(\w+) for complete details, or call the "
+    r"GetRequestAuthorizationDetails API with the following authorization id: \1"
+)
+
+
+def _expected_denial(message, head):
+    """``head`` followed by the authorization-details pointer that ends ``message``: the pointer's
+    region and per-request authorization id are the only parts read back from it."""
+    found = re.search(_AUTHZ_TAIL + r"\Z", message or "")
+    return head + (found.group(0) if found else ". Go to <authorization-details pointer>")
+
 
 @tags("axis:rejection", "cap:c7", "concern:negative-classes", "plane:control")
 def run(ctx) -> None:
@@ -241,10 +259,10 @@ def run(ctx) -> None:
         "an exact Action must not be matched as a prefix: a session policy granting only "
         f"iam:ListRoles allowed iam:ListUsers (got {code_exact!r})"
     )
-    assert message_exact == (
+    assert message_exact == _expected_denial(message_exact, (
         f"User: {exact_arn} is not authorized to perform: iam:ListUsers on resource: "
         f"arn:aws:iam::{_account_id()}:user/ because no session policy allows the iam:ListUsers action"
-    ), message_exact
+    )), message_exact
 
     # (b) prefix wildcard: must not be widened to the whole service.
     prefix, prefix_arn = _scoped(["iam:ListR*"])
@@ -257,10 +275,10 @@ def run(ctx) -> None:
         "a prefix wildcard must not be widened to the service: a session policy granting only "
         f"iam:ListR* allowed iam:ListUsers (got {code_prefix!r})"
     )
-    assert message_prefix == (
+    assert message_prefix == _expected_denial(message_prefix, (
         f"User: {prefix_arn} is not authorized to perform: iam:ListUsers on resource: "
         f"arn:aws:iam::{_account_id()}:user/ because no session policy allows the iam:ListUsers action"
-    ), message_prefix
+    )), message_prefix
 
     # (c) proves the matcher does not just deny every wildcard, which would pass (a) and (b).
     broad, _broad_arn = _scoped(["iam:List*"])

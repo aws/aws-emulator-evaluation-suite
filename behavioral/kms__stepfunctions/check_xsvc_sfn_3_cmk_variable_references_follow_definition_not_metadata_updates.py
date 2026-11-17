@@ -136,7 +136,7 @@ def _state_machine(ctx, role_arn: str, key_arn: str, definition: dict) -> str:
             last = exc
             time.sleep(5.0)
             continue
-        ctx.on_cleanup(lambda a=arn: sfn.delete_state_machine(stateMachineArn=a))
+        ctx.on_cleanup(lambda a=arn: _delete_state_machine(sfn, a))
         return arn
     raise AssertionError(f"CreateStateMachine still AccessDenied after 120s: {last}")
 
@@ -154,6 +154,20 @@ def _wait_revision(ctx, arn: str, want_state: str) -> None:
     raise AssertionError(
         f"DescribeStateMachine still shows the old definition {60}s after UpdateStateMachine; "
         f"got {last and last.get('definition')!r}")
+
+
+def _delete_state_machine(sfn, arn: str, timeout_s: float = 300.0) -> None:
+    """Delete a state machine, then poll until DescribeStateMachine no longer finds it."""
+    sfn.delete_state_machine(stateMachineArn=arn)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            # The service deletes in the background, still using the key.
+            sfn.describe_state_machine(stateMachineArn=arn, includedData="METADATA_ONLY")
+        except sfn.exceptions.StateMachineDoesNotExist:
+            return
+        time.sleep(2.0)
+    raise AssertionError(f"state machine {arn} still exists {timeout_s}s after DeleteStateMachine")
 
 
 if __name__ == "__main__":

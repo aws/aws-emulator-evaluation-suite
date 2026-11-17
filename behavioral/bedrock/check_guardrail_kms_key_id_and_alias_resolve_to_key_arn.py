@@ -25,6 +25,20 @@ def _wait_ready(bc, gid):
     )
 
 
+def _delete_guardrail(bc, gid, timeout_s: float = 50.0) -> None:
+    """Delete a guardrail and wait until it reads as gone, so its KMS key is retired after it."""
+    bc.delete_guardrail(guardrailIdentifier=gid)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:  # the guardrail deletes in the background
+        try:  # listed, not read: a read of a deleted CMK guardrail can be refused instead
+            if not bc.list_guardrails(guardrailIdentifier=gid).get("guardrails"):
+                return
+        except bc.exceptions.ResourceNotFoundException:
+            return
+        time.sleep(3)
+    raise AssertionError(f"guardrail {gid} still present {timeout_s}s after its delete")
+
+
 @tags("axis:happy-path", "cap:c1", "concern:representation", "plane:control")
 def run(ctx) -> None:
     """GetGuardrail reports kmsKeyArn as the key ARN given on create, and after UpdateGuardrail with
@@ -60,7 +74,7 @@ def run(ctx) -> None:
         wordPolicyConfig={"wordsConfig": [{"text": "sim2real-grkms-blockedword"}]},
     )
     gid = create_resp["guardrailId"]
-    ctx.on_cleanup(lambda: bc.delete_guardrail(guardrailIdentifier=gid))
+    ctx.on_cleanup(lambda: _delete_guardrail(bc, gid))
 
     _wait_ready(bc, gid)
 

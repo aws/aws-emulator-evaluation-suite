@@ -131,7 +131,7 @@ def _create_lambda_function(ctx, role_arn, code_str, env=None, timeout=30):
     ctx.on_cleanup(lambda: lam.delete_function(FunctionName=func_name))
     # A first invoke auto-creates /aws/lambda/<name>, which survives function deletion.
     ctx.on_cleanup(
-        lambda: ctx.client("logs").delete_log_group(logGroupName=f"/aws/lambda/{func_name}")
+        lambda: _delete_function_log_group(ctx, f"/aws/lambda/{func_name}")
     )
     lam.get_waiter("function_active_v2").wait(FunctionName=func_name, WaiterConfig={"Delay": 2, "MaxAttempts": 150})
     return func_name
@@ -146,6 +146,15 @@ def _invoke_lambda(ctx, func_name, payload):
     )
     assert "FunctionError" not in resp, f"lambda invocation raised unhandled error: {resp}"
     return json.loads(resp["Payload"].read())
+
+
+def _delete_function_log_group(ctx, name: str) -> None:
+    """Delete a function's log group, which exists only once the function has written a log line."""
+    logs = ctx.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=name)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
 
 
 if __name__ == "__main__":

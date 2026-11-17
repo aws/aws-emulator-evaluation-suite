@@ -506,7 +506,7 @@ def _create_traced_lambda(ctx, handler_code: str, extra_statements=None,
     # /aws/lambda/<name> is created by the SERVICE, asynchronously, on first invoke, and survives
     # the function. Registered BEFORE the function delete so LIFO runs it AFTER: a group that
     # materialises late still gets deleted, whereas the other order loses the race and leaks it.
-    ctx.on_cleanup(lambda: ctx.client("logs").delete_log_group(logGroupName=f"/aws/lambda/{name}"))
+    ctx.on_cleanup(lambda: _delete_function_log_group(ctx, f"/aws/lambda/{name}"))
     ctx.on_cleanup(lambda: lam.delete_function(FunctionName=name))
     cfg = _poll_until(
         lambda: lam.get_function_configuration(FunctionName=name),
@@ -668,6 +668,15 @@ def _one(docs: list, origin: str) -> dict:
         f"{[(d.get('id'), d.get('name')) for d in hits]!r}"
     )
     return hits[0]
+
+
+def _delete_function_log_group(ctx, name: str) -> None:
+    """Delete a function's log group, which exists only once the function has written a log line."""
+    logs = ctx.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=name)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
 
 
 if __name__ == "__main__":

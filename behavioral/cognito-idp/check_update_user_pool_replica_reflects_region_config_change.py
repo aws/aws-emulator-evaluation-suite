@@ -106,7 +106,8 @@ def run(ctx) -> None:
             f"multi-Region replication) in this account/region: {_error_code(exc)}: {exc}"
         )
     pool_id = pool["Id"]
-    ctx.on_cleanup(lambda: cognito.delete_user_pool(UserPoolId=pool_id))
+    cleanup_deadline: dict = {}
+    ctx.on_cleanup(lambda: _delete_pool(cognito, pool_id, cleanup_deadline))
 
     try:
         cognito.create_user_pool_replica(UserPoolId=pool_id, RegionName=secondary_region)
@@ -117,7 +118,7 @@ def run(ctx) -> None:
             f"eligibility: {_error_code(exc)}: {exc}"
         )
     ctx.on_cleanup(
-        lambda: cognito.delete_user_pool_replica(UserPoolId=pool_id, RegionName=secondary_region)
+        lambda: _delete_replica(cognito, pool_id, secondary_region, cleanup_deadline)
     )
 
     def _replica_status() -> str | None:
@@ -148,6 +149,62 @@ def run(ctx) -> None:
         f"replica status regressed on a follow-up ListUserPoolReplicas read, expected "
         f"INACTIVE to persist, got {durable_status!r}"
     )
+
+
+_CLEANUP_S = 1800.0  # the suite's cleanup budget, shared by the check's teardowns
+_CLEANUP_HEADROOM_S = 120.0
+_REPLICAS_LEFT = (
+    "Cannot delete user pool that has secondary replicas. "
+    "Please delete all replicas before deleting the user pool."
+)
+
+
+def _delete_replica(cognito, pool_id: str, region: str, cleanup_deadline: dict) -> None:
+    """Delete the replica and wait until it is unlisted, so the pool and its keys go after it."""
+    deadline = cleanup_deadline.setdefault(
+        "t", time.monotonic() + _CLEANUP_S - _CLEANUP_HEADROOM_S
+    )
+    try:
+        cognito.delete_user_pool_replica(UserPoolId=pool_id, RegionName=region)
+    except ClientError as exc:
+        if _error_code(exc) == "ResourceNotFoundException":
+            return
+        raise
+    while time.monotonic() < deadline:  # the replica deletes in the background
+        replicas = cognito.list_user_pool_replicas(UserPoolId=pool_id)["UserPoolReplicas"]
+        if not any(r.get("RegionName") == region for r in replicas):
+            return
+        time.sleep(5)
+    raise RuntimeError(f"replica {region} of {pool_id} not deleted within the cleanup budget")
+
+
+def _delete_pool(cognito, pool_id: str, cleanup_deadline: dict) -> None:
+    """Delete the pool, retrying while a replica is still attached; wait until it is gone."""
+    deadline = cleanup_deadline.setdefault(
+        "t", time.monotonic() + _CLEANUP_S - _CLEANUP_HEADROOM_S
+    )
+    while True:
+        try:
+            cognito.delete_user_pool(UserPoolId=pool_id)
+            break
+        except ClientError as exc:
+            error = exc.response["Error"]
+            if error["Code"] == "ResourceNotFoundException":
+                return
+            refused = (error["Code"], error.get("Message")) == (
+                "InvalidParameterException",
+                _REPLICAS_LEFT,
+            )
+            if not refused or time.monotonic() >= deadline:
+                raise
+        time.sleep(2)
+    while time.monotonic() < deadline:  # the pool deletes in the background
+        try:
+            cognito.describe_user_pool(UserPoolId=pool_id)
+        except cognito.exceptions.ResourceNotFoundException:
+            return
+        time.sleep(2)
+    raise RuntimeError(f"user pool {pool_id} still present within the cleanup budget")
 
 
 def _error_code(exc: ClientError) -> str | None:

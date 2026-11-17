@@ -48,7 +48,7 @@ def run(ctx) -> None:
     created = cc.create_repository(
         repositoryName=repo, kmsKeyId=key_a["Arn"], tags={"sim2real": "cckey"}
     )["repositoryMetadata"]
-    ctx.on_cleanup(lambda: cc.delete_repository(repositoryName=repo))
+    ctx.on_cleanup(lambda: _delete_repository(cc, repo))
     repo_id = created["repositoryId"]
     assert _uuid(created["kmsKeyId"]) == _uuid(key_a["Arn"]), (
         f"CreateRepository reports kmsKeyId {created['kmsKeyId']!r}, expected the old CMK "
@@ -204,6 +204,19 @@ def _create_key(ctx, kms, role: str) -> dict:
         f"a freshly created CMK reports KeyState {meta['KeyState']!r}, expected 'Enabled'"
     )
     return meta
+
+
+def _delete_repository(cc, repo: str, timeout_s: float = 30.0) -> None:
+    """Delete a repository and wait until it reads as gone, so its KMS key is retired after it."""
+    cc.delete_repository(repositoryName=repo)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:  # the repository deletes in the background
+        try:
+            cc.get_repository(repositoryName=repo)
+        except cc.exceptions.RepositoryDoesNotExistException:
+            return
+        time.sleep(2.0)
+    raise AssertionError(f"repository {repo} still present {timeout_s}s after its delete")
 
 
 def _uuid(key_ref: str) -> str:

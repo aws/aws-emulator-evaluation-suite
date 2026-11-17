@@ -157,12 +157,24 @@ def _ecr_grants(grants):
     ]
 
 
-def _delete_repository_quietly(ecr, name):
+def _delete_repository_quietly(ecr, name, timeout_s=30.0):
     try:
         ecr.delete_repository(repositoryName=name, force=True)
     except ClientError as exc:
         if exc.response.get("Error", {}).get("Code") != "RepositoryNotFoundException":
             raise
+        return
+    # Confirm the repository is gone before the key's teardown runs.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            ecr.describe_repositories(repositoryNames=[name])
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "RepositoryNotFoundException":
+                return
+            raise
+        time.sleep(2)
+    raise AssertionError(f"repository {name} still exists {timeout_s}s after its delete")
 
 
 @tags(

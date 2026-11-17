@@ -5,11 +5,17 @@ from typing import Any
 
 from botocore.exceptions import ClientError
 
+from botocore.config import Config
 from behavioral_harness import tags
 
 CHECK = "directory-bucket-sse-kms-customer-managed-key-round-trips"
 GROUP = "server_side_encryption"
 SERVICES = ["ec2", "kms", "s3"]
+
+
+def _s3_control(ctx):
+    """S3 for a directory bucket's control calls, which AWS serves without an S3 Express session."""
+    return ctx.client("s3", config=Config(s3={"disable_s3_express_session_auth": True}))
 
 
 @tags("axis:happy-path", "cap:c2", "concern:data-plane", "concern:representation", "dp:api", "plane:data")
@@ -28,7 +34,7 @@ def run(ctx) -> None:
     key_arn = key["Arn"]
     ctx.on_cleanup(lambda: kms.schedule_key_deletion(KeyId=key_arn, PendingWindowInDays=7))
 
-    s3.put_bucket_encryption(
+    _s3_control(ctx).put_bucket_encryption(
         Bucket=bucket,
         ServerSideEncryptionConfiguration={
             "Rules": [{
@@ -40,7 +46,7 @@ def run(ctx) -> None:
             }]
         },
     )
-    rules = s3.get_bucket_encryption(Bucket=bucket)["ServerSideEncryptionConfiguration"]["Rules"]
+    rules = _s3_control(ctx).get_bucket_encryption(Bucket=bucket)["ServerSideEncryptionConfiguration"]["Rules"]
     default = rules[0]["ApplyServerSideEncryptionByDefault"]
     assert default.get("SSEAlgorithm") == "aws:kms" and default.get("KMSMasterKeyID") == key_arn, (
         f"stored default encryption is {default!r}, expected aws:kms with key {key_arn!r}"
@@ -113,7 +119,7 @@ def _create_directory_bucket(ctx: Any) -> str:
     for zone_id in zone_ids:
         candidate = f"{base}--{zone_id}--x-s3"
         try:
-            s3.create_bucket(
+            _s3_control(ctx).create_bucket(
                 Bucket=candidate,
                 CreateBucketConfiguration={
                     "Location": {"Type": "AvailabilityZone", "Name": zone_id},
@@ -140,7 +146,7 @@ def _create_directory_bucket(ctx: Any) -> str:
             if exc.response["Error"]["Code"] not in ("NoSuchBucket", "NoSuchKey"):
                 raise
         try:
-            s3.delete_bucket(Bucket=bucket)
+            _s3_control(ctx).delete_bucket(Bucket=bucket)
         except ClientError as exc:
             if exc.response["Error"]["Code"] != "NoSuchBucket":
                 raise

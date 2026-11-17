@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import ssl
 import time
 import urllib.request
@@ -59,14 +60,30 @@ def run(ctx) -> None:
     assert code == "AccessDenied", f"expected AccessDenied for an ungranted action, got {code!r}"
     session_arn = resp["assumedRoleUser"]["arn"]
     account = session_arn.split(":")[4]
-    expected = (
+    expected = _expected_denial(message, (
         f"User: {session_arn} is not authorized to perform: iam:ListRoles on resource: "
         f"arn:aws:iam::{account}:role/ because no identity-based policy allows the iam:ListRoles action"
-    )
+    ))
     assert message == expected, f"EXPECTED_MESSAGE={expected!r} GOT={message!r}"
 
 
 # ===== shared helpers =====
+# IAM ends a denial with a pointer to a per-request authorization id, given twice (in a console URL
+# and on its own); every other character is graded.
+_AUTHZ_TAIL = (
+    r"\. Go to https://[a-z0-9-]+\.console\.aws\.amazon\.com/iam/home\?region=[a-z0-9-]+"
+    r"#/authorization-details/(\w+) for complete details, or call the "
+    r"GetRequestAuthorizationDetails API with the following authorization id: \1"
+)
+
+
+def _expected_denial(message, head):
+    """``head`` followed by the authorization-details pointer that ends ``message``: the pointer's
+    region and per-request authorization id are the only parts read back from it."""
+    found = re.search(_AUTHZ_TAIL + r"\Z", message or "")
+    return head + (found.group(0) if found else ". Go to <authorization-details pointer>")
+
+
 def _client_error(fn):
     """Call fn(); return its botocore error (code, message). An unexpected SUCCESS raises, because
     turning acceptance into a falsy sentinel would let an over-permissive target read as

@@ -113,7 +113,7 @@ def _create_state_machine(ctx, role_arn: str, key_arn: str, timeout_s: float = 1
             time.sleep(3.0)
     else:
         raise AssertionError(f"CreateStateMachine still AccessDenied after {timeout_s}s: {last}")
-    ctx.on_cleanup(lambda: sfn.delete_state_machine(stateMachineArn=arn))
+    ctx.on_cleanup(lambda: _delete_state_machine(sfn, arn))
     return arn
 
 
@@ -165,6 +165,20 @@ def _wait_terminal(ctx, exec_arn: str, timeout_s: float = 120.0, poll_s: float =
             return last
         time.sleep(poll_s)
     raise AssertionError(f"execution {exec_arn} still RUNNING after {timeout_s}s: {last!r}")
+
+
+def _delete_state_machine(sfn, arn: str, timeout_s: float = 300.0) -> None:
+    """Delete a state machine, then poll until DescribeStateMachine no longer finds it."""
+    sfn.delete_state_machine(stateMachineArn=arn)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            # The service deletes in the background, still using the key.
+            sfn.describe_state_machine(stateMachineArn=arn, includedData="METADATA_ONLY")
+        except sfn.exceptions.StateMachineDoesNotExist:
+            return
+        time.sleep(2.0)
+    raise AssertionError(f"state machine {arn} still exists {timeout_s}s after DeleteStateMachine")
 
 
 if __name__ == "__main__":

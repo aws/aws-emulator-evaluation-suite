@@ -23,12 +23,20 @@ def _error_code(fn):
     raise AssertionError(f"the call was expected to be refused but it succeeded, returning {result!r}")
 
 
-def _delete_log_group_if_present(svc, name):
+def _delete_log_group_if_present(svc, name, timeout_s=30.0):
     try:
         svc.delete_log_group(logGroupName=name)
     except ClientError as exc:
         if exc.response.get("Error", {}).get("Code") != "ResourceNotFoundException":
             raise
+    # Wait until the group is gone: a KMS key teardown may run next.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        found = svc.describe_log_groups(logGroupNamePrefix=name).get("logGroups", [])
+        if not any(g["logGroupName"] == name for g in found):
+            return
+        time.sleep(2)
+    raise AssertionError(f"log group {name} still present after {timeout_s}s")
 
 
 def _describe_log_group(svc, name):
@@ -165,6 +173,7 @@ def run(ctx) -> None:
         raise AssertionError(
             f"expected AssociateKmsKey with a valid key to eventually succeed, got {last_err}"
         )
+    ctx.on_cleanup(lambda _n=valid_group: _delete_log_group_if_present(svc, _n))
     assert _describe_log_group(svc, valid_group).get("kmsKeyId") == key_arn, (
         "a valid kmsKeyId did not take effect after AssociateKmsKey"
     )

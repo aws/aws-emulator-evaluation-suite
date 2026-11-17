@@ -279,7 +279,7 @@ def _create_lambda_function(
     ctx.on_cleanup(lambda: lam.delete_function(FunctionName=name))
     # An actually-invoked function auto-creates /aws/lambda/<name>, which outlives the
     # function's own deletion.
-    ctx.on_cleanup(lambda: ctx.client("logs").delete_log_group(logGroupName=f"/aws/lambda/{name}"))
+    ctx.on_cleanup(lambda: _delete_function_log_group(ctx, f"/aws/lambda/{name}"))
     _poll_until(
         lambda: lam.get_function_configuration(FunctionName=name)["State"],
         lambda s: s == "Active",
@@ -417,6 +417,15 @@ def _add_lambda_permission_for_rule(ctx, function_name, rule_arn, statement_id=N
         SourceArn=rule_arn,
     )
     ctx.on_cleanup(lambda: lam.remove_permission(FunctionName=function_name, StatementId=sid))
+
+
+def _delete_function_log_group(ctx, name: str) -> None:
+    """Delete a function's log group, which exists only once the function has written a log line."""
+    logs = ctx.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=name)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
 
 
 if __name__ == "__main__":

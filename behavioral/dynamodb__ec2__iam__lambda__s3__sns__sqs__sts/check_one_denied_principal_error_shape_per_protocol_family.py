@@ -1,6 +1,7 @@
 """one-denied-principal-error-shape-per-protocol-family."""
 from __future__ import annotations
 
+import re
 import time
 
 from botocore.exceptions import ClientError
@@ -64,6 +65,22 @@ def _denied_call(ctx, service, creds, call):
     raise AssertionError(
         f"{service} call unexpectedly SUCCEEDED for a principal with zero attached permissions"
     )
+
+
+# IAM ends a denial with a pointer to a per-request authorization id, given twice (in a console URL
+# and on its own); every other character is graded.
+_AUTHZ_TAIL = (
+    r"\. Go to https://[a-z0-9-]+\.console\.aws\.amazon\.com/iam/home\?region=[a-z0-9-]+"
+    r"#/authorization-details/(\w+) for complete details, or call the "
+    r"GetRequestAuthorizationDetails API with the following authorization id: \1"
+)
+
+
+def _expected_denial(message, head):
+    """``head`` followed by the authorization-details pointer that ends ``message``: the pointer's
+    region and per-request authorization id are the only parts read back from it."""
+    found = re.search(_AUTHZ_TAIL + r"\Z", message or "")
+    return head + (found.group(0) if found else ". Go to <authorization-details pointer>")
 
 
 @tags("axis:rejection", "cap:c7", "concern:negative-classes", "plane:control")
@@ -185,6 +202,8 @@ def run(ctx) -> None:
     }
     for service, (expected_code, call, want) in query_family.items():
         code, status, ctype, body, _headers, message = _denied_call(ctx, service, denied_creds, call)
+        if service == "iam":
+            want = _expected_denial(message, want)
         assert code == expected_code, f"{service} denial code was {code!r}, expected {expected_code!r}"
         assert message == want, f"{service} denial message was {message!r}, expected {want!r}"
         assert status == 403, f"{service} denial HTTP status was {status!r}, expected 403"

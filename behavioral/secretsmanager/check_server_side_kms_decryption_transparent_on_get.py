@@ -1,11 +1,30 @@
 """server-side-kms-decryption-transparent-on-get."""
 from __future__ import annotations
 
+import time
+
+from botocore.exceptions import ClientError
+
 from behavioral_harness import tags
 
 CHECK = "server-side-kms-decryption-transparent-on-get"
 GROUP = "server-side"
 SERVICES = ["secretsmanager"]
+
+
+def _force_delete_until_gone(sm, secret_id, timeout_s=30.0):
+    sm.delete_secret(SecretId=secret_id, ForceDeleteWithoutRecovery=True)
+    # Secrets Manager deletes the secret in the background, still using its key until it is gone.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            sm.describe_secret(SecretId=secret_id)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ResourceNotFoundException":
+                return
+            raise
+        time.sleep(2)
+    raise AssertionError(f"secret {secret_id} still exists {timeout_s}s after its delete")
 
 
 @tags("axis:happy-path", "cap:c2", "concern:data-plane", "concern:representation", "dp:api", "plane:data")
@@ -33,7 +52,7 @@ def run(ctx) -> None:
         KmsKeyId=key_id,
         Tags=[{"Key": "sim2real-audit", "Value": "true"}],
     )
-    ctx.on_cleanup(lambda: sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True))
+    ctx.on_cleanup(lambda: _force_delete_until_gone(sm, name))
 
     desc = sm.describe_secret(SecretId=name)
     assert desc["KmsKeyId"] in (key_id, key_arn), "DescribeSecret did not record the CMK used"

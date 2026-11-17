@@ -6,6 +6,7 @@ import time
 
 from botocore.exceptions import ClientError
 
+from botocore.config import Config
 from behavioral_harness import tags
 
 CHECK = "deploy-s3express-directorybucket-bucketpolicy-accesspoint-round-trip-then-delete"
@@ -21,6 +22,11 @@ _TERMINAL = frozenset({
     "IMPORT_ROLLBACK_FAILED",
 })
 _DELETE_BUDGET_S = 600.0  # per stack; at most two stacks fit the suites' 1800 s cleanup budget
+
+
+def _s3_control(ctx):
+    """S3 for a directory bucket's control calls, which AWS serves without an S3 Express session."""
+    return ctx.client("s3", config=Config(s3={"disable_s3_express_session_auth": True}))
 
 
 def paginate(client, op, key, **kw):
@@ -252,7 +258,7 @@ def run(ctx) -> None:
     assert out["BucketAz"] == zone["ZoneName"], (
         f"GetAtt AvailabilityZoneName {out['BucketAz']!r}, EC2 ZoneName {zone['ZoneName']!r}"
     )
-    policy = json.loads(s3.get_bucket_policy(Bucket=bucket)["Policy"])
+    policy = json.loads(_s3_control(ctx).get_bucket_policy(Bucket=bucket)["Policy"])
     want_policy = _policy(f"arn:{partition}:iam::{ctx.account}:root", bucket_arn)
     assert policy == want_policy, f"bucket policy {policy!r}, expected {want_policy!r}"
 
@@ -281,13 +287,13 @@ def run(ctx) -> None:
         *not_found,
     )
     not_found_2 = ("NoSuchBucketPolicy", "The bucket policy does not exist")
-    expect_error(lambda: s3.get_bucket_policy(Bucket=bucket), *not_found_2)
+    expect_error(lambda: _s3_control(ctx).get_bucket_policy(Bucket=bucket), *not_found_2)
     assert s3.head_bucket(Bucket=bucket)["BucketArn"] == bucket_arn, "the bucket no longer answers"
 
     delete_stack(cf, stack_id)
     until_raises(lambda: s3.head_bucket(Bucket=bucket))
     not_found_3 = ("NoSuchBucket", "The specified bucket does not exist")
-    expect_error(lambda: s3.get_bucket_policy(Bucket=bucket), *not_found_3)
+    expect_error(lambda: _s3_control(ctx).get_bucket_policy(Bucket=bucket), *not_found_3)
     gone = [b for b in paginate(s3, "list_directory_buckets", "Buckets") if b["Name"] == bucket]
     assert gone == [], f"the deleted bucket is still listed: {gone!r}"
 

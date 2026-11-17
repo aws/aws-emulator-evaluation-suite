@@ -516,9 +516,7 @@ def _create_function_with_retry(
             resp = lam.create_function(**kwargs)
             ctx.on_cleanup(lambda: lam.delete_function(FunctionName=name))
             ctx.on_cleanup(
-                lambda: ctx.client("logs").delete_log_group(
-                    logGroupName=f"/aws/lambda/{name}"
-                )
+                lambda: _delete_function_log_group(ctx, f"/aws/lambda/{name}")
             )
             _wait_function_active(ctx, name)
             return {"name": name, "arn": resp["FunctionArn"]}
@@ -621,6 +619,15 @@ def _log_events_containing(ctx, log_group, needle, start_ms=None):
         if e.response["Error"]["Code"] != "ResourceNotFoundException":
             raise
     return out
+
+
+def _delete_function_log_group(ctx, name: str) -> None:
+    """Delete a function's log group, which exists only once the function has written a log line."""
+    logs = ctx.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=name)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
 
 
 if __name__ == "__main__":

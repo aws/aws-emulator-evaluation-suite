@@ -35,6 +35,21 @@ def _teardown(undo, *not_found: str):
     return run_undo
 
 
+def _delete_vector_bucket(s3v, bucket, timeout_s=20.0):
+    """Delete the vector bucket and confirm it reads as gone, so its KMS key is retired after it."""
+    s3v.delete_vector_bucket(vectorBucketName=bucket)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            s3v.get_vector_bucket(vectorBucketName=bucket)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "NotFoundException":
+                return
+            raise
+        time.sleep(2.0)
+    raise AssertionError(f"vector bucket {bucket} still present {timeout_s}s after its delete")
+
+
 def _error(fn):
     """(code, message) of the error ``fn`` raises. An unexpected success raises too."""
     try:
@@ -92,8 +107,7 @@ def run(ctx) -> None:
     bucket = ctx.unique_name("sim2real-behav-s3v-kms-")
     s3v.create_vector_bucket(vectorBucketName=bucket,
                              encryptionConfiguration={"sseType": "aws:kms", "kmsKeyArn": key_arn})
-    ctx.on_cleanup(_teardown(lambda: s3v.delete_vector_bucket(vectorBucketName=bucket),
-                             "NotFoundException"))
+    ctx.on_cleanup(_teardown(lambda: _delete_vector_bucket(s3v, bucket), "NotFoundException"))
     index = ctx.unique_name("sim2real-behav-idx-")
     _create_index(s3v, bucket, index)
     ctx.on_cleanup(_teardown(lambda: s3v.delete_index(vectorBucketName=bucket, indexName=index),

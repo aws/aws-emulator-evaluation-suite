@@ -207,7 +207,7 @@ def run(ctx) -> None:
     good_arn = _retry_propagation(
         lambda: _create(good_name),
         {"AccessDeniedException", "KmsAccessDeniedException", "UnrecognizedClientException"})
-    ctx.on_cleanup(_teardown(lambda: sfn.delete_state_machine(stateMachineArn=good_arn),
+    ctx.on_cleanup(_teardown(lambda: _delete_state_machine(sfn, good_arn),
                               "StateMachineDoesNotExist"))
     desc = sfn.describe_state_machine(stateMachineArn=good_arn)
     assert desc["stateMachineArn"] == good_arn, (
@@ -236,11 +236,25 @@ def run(ctx) -> None:
                                   "kmsDataKeyReusePeriodSeconds": 60},
         tags=[{"key": "sim2real", "value": CHECK[:250]}],
     )["stateMachineArn"]
-    ctx.on_cleanup(_teardown(lambda: sfn.delete_state_machine(stateMachineArn=control_arn),
+    ctx.on_cleanup(_teardown(lambda: _delete_state_machine(sfn, control_arn),
                               "StateMachineDoesNotExist"))
     assert control_arn == bad_arn, (
         f"the control create must land on the same ARN the restricted caller was refused; "
         f"got {control_arn!r}, expected {bad_arn!r}")
+
+
+def _delete_state_machine(sfn, arn: str, timeout_s: float = 300.0) -> None:
+    """Delete a state machine, then poll until DescribeStateMachine no longer finds it."""
+    sfn.delete_state_machine(stateMachineArn=arn)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            # The service deletes in the background, still using the key.
+            sfn.describe_state_machine(stateMachineArn=arn, includedData="METADATA_ONLY")
+        except sfn.exceptions.StateMachineDoesNotExist:
+            return
+        time.sleep(2.0)
+    raise AssertionError(f"state machine {arn} still exists {timeout_s}s after DeleteStateMachine")
 
 
 if __name__ == "__main__":

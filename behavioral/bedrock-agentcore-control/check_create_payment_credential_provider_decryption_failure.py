@@ -42,7 +42,7 @@ def run(ctx) -> None:
         Tags=[{"Key": "sim2real", "Value": CHECK}],
     )
     secret_arn = secret["ARN"]
-    ctx.on_cleanup(lambda: secretsmanager.delete_secret(SecretId=secret_arn, ForceDeleteWithoutRecovery=True))
+    ctx.on_cleanup(lambda: _delete_secret(secretsmanager, secret_arn))
 
     def _create_kwargs(name: str) -> dict:
         return dict(
@@ -160,6 +160,19 @@ def _retire_key(kms, key_id: str) -> None:
     except ClientError as exc:
         if exc.response["Error"]["Code"] != "NotFoundException":
             raise
+
+
+def _delete_secret(secretsmanager, secret_arn: str, timeout_s: float = 25.0) -> None:
+    """Force-delete a secret and wait until it reads as gone, so its KMS key is retired after it."""
+    secretsmanager.delete_secret(SecretId=secret_arn, ForceDeleteWithoutRecovery=True)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:  # the secret deletes in the background
+        try:
+            secretsmanager.describe_secret(SecretId=secret_arn)
+        except secretsmanager.exceptions.ResourceNotFoundException:
+            return
+        time.sleep(2.0)
+    raise AssertionError(f"secret {secret_arn} still present {timeout_s}s after its delete")
 
 
 def _best_effort_delete(control, name: str) -> None:

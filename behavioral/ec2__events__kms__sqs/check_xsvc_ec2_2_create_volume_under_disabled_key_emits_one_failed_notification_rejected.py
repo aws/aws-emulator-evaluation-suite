@@ -199,13 +199,16 @@ def _delete_volume(ec2, vid):
     while True:
         try:
             ec2.delete_volume(VolumeId=vid)
-            return
+            break
         except ClientError as exc:
             if _code(exc) == "InvalidVolume.NotFound":
                 return
             if _code(exc) != "IncorrectState" or time.monotonic() > deadline:
                 raise
             time.sleep(5)
+    # Wait until the volume is gone: EC2 deletes in the background, the key teardown runs next.
+    ec2.get_waiter("volume_deleted").wait(
+        VolumeIds=[vid], WaiterConfig={"Delay": 2, "MaxAttempts": 150})
 
 
 def _wire(ctx, events, sqs, account, name, pattern):

@@ -300,7 +300,7 @@ def _create_echo_lambda(ctx) -> str:
         raise last_err or RuntimeError(f"Failed to create Lambda {fn_name}")
     ctx.on_cleanup(lambda: lam.delete_function(FunctionName=fn_name))
     ctx.on_cleanup(
-        lambda: ctx.client("logs").delete_log_group(logGroupName=f"/aws/lambda/{fn_name}")
+        lambda: _delete_function_log_group(ctx, f"/aws/lambda/{fn_name}")
     )
 
     _poll_until(
@@ -311,6 +311,15 @@ def _create_echo_lambda(ctx) -> str:
         description=f"Lambda {fn_name} active",
     )
     return resp["FunctionArn"]
+
+
+def _delete_function_log_group(ctx, name: str) -> None:
+    """Delete a function's log group, which exists only once the function has written a log line."""
+    logs = ctx.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=name)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
 
 
 if __name__ == "__main__":

@@ -33,16 +33,14 @@ def run(ctx) -> None:
     group = ctx.unique_name("sim2real-logcmk-dis-")
     stream = "s1"
     logs.create_log_group(logGroupName=group, tags={"sim2real": CHECK})
-    ctx.on_cleanup(lambda: logs.delete_log_group(logGroupName=group))
+    ctx.on_cleanup(lambda: _delete_group_and_wait(logs, group))
     logs.create_log_stream(logGroupName=group, logStreamName=stream)
 
     kms.disable_key(KeyId=key_arn)
-    state = kms.describe_key(KeyId=key_arn)["KeyMetadata"]["KeyState"]
+    state = _key_state_once(kms, key_arn, "Disabled")
     assert state == "Disabled", f"key state after DisableKey is {state!r}, expected 'Disabled'"
 
-    code, message = _error(
-        lambda: logs.associate_kms_key(logGroupName=group, kmsKeyId=key_arn), ClientError
-    )
+    code, message = _steady_refusal(logs, ClientError, group, key_arn)
     assert code == "InvalidParameterException", (
         f"AssociateKmsKey with a disabled key returned {code!r}, expected InvalidParameterException"
     )
@@ -72,6 +70,38 @@ def run(ctx) -> None:
     read = _poll(lambda: _read_messages(logs, group, stream), lambda m: m == [msg],
                  timeout_s=60, what="the event to be readable through the re-enabled key")
     assert read == [msg], f"GetLogEvents through the re-enabled CMK returned {read!r}"
+
+
+_REFUSAL_TIMEOUT_S = 300.0
+
+
+def _key_state_once(kms, key_arn: str, want: str, timeout_s: float = 30.0) -> str:
+    """The key's state once DescribeKey reports ``want``, or the last state after timeout_s."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        state = kms.describe_key(KeyId=key_arn)["KeyMetadata"]["KeyState"]
+        if state == want or time.monotonic() > deadline:
+            return state
+        time.sleep(1)
+
+
+def _steady_refusal(logs, client_error, group: str, key_arn: str) -> tuple[str, str]:
+    """(code, message) of AssociateKmsKey with the disabled key once the disable has reached
+    CloudWatch Logs: an association accepted while it propagates is undone and the call retried
+    until _REFUSAL_TIMEOUT_S passes."""
+    deadline = time.monotonic() + _REFUSAL_TIMEOUT_S
+    while time.monotonic() < deadline:
+        try:
+            logs.associate_kms_key(logGroupName=group, kmsKeyId=key_arn)
+        except client_error as exc:
+            return exc.response["Error"]["Code"], exc.response["Error"].get("Message", "")
+        logs.disassociate_kms_key(logGroupName=group)
+        _poll(lambda: _describe_group(logs, group), lambda g: "kmsKeyId" not in g,
+              timeout_s=60, what="kmsKeyId to clear after DisassociateKmsKey")
+        time.sleep(2)
+    return _error(
+        lambda: logs.associate_kms_key(logGroupName=group, kmsKeyId=key_arn), client_error
+    )
 
 
 def _error(fn, client_error) -> tuple[str, str]:
@@ -161,6 +191,18 @@ def _poll(probe, predicate, *, timeout_s: float, what: str, interval_s: float = 
         if time.monotonic() > deadline:
             raise AssertionError(f"timed out after {timeout_s}s waiting for {what}; last={last!r}")
         time.sleep(interval_s)
+
+
+def _delete_group_and_wait(logs, group: str, timeout_s: float = 30.0) -> None:
+    logs.delete_log_group(logGroupName=group)
+    # Wait until the group is gone: the key's teardown runs next.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        found = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"]
+        if not any(g["logGroupName"] == group for g in found):
+            return
+        time.sleep(2)
+    raise AssertionError(f"log group {group} still present after {timeout_s}s")
 
 
 if __name__ == "__main__":

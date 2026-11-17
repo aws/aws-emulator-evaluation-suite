@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 
 from botocore.exceptions import ClientError
@@ -135,6 +136,22 @@ def _denial(fn, what):
         err = exc.response.get("Error", {})
         return err.get("Code"), err.get("Message")
     raise AssertionError(f"{what} must be refused, but the call succeeded")
+
+
+# IAM ends a denial with a pointer to a per-request authorization id, given twice (in a console URL
+# and on its own); every other character is graded.
+_AUTHZ_TAIL = (
+    r"\. Go to https://[a-z0-9-]+\.console\.aws\.amazon\.com/iam/home\?region=[a-z0-9-]+"
+    r"#/authorization-details/(\w+) for complete details, or call the "
+    r"GetRequestAuthorizationDetails API with the following authorization id: \1"
+)
+
+
+def _expected_denial(message, head):
+    """``head`` followed by the authorization-details pointer that ends ``message``: the pointer's
+    region and per-request authorization id are the only parts read back from it."""
+    found = re.search(_AUTHZ_TAIL + r"\Z", message or "")
+    return head + (found.group(0) if found else ". Go to <authorization-details pointer>")
 
 
 def _denied_message(principal, action, ceiling, resource=None):
@@ -278,9 +295,9 @@ def run(ctx) -> None:
         ),
     )["message"]
     # Every vended session of this role carries the same session name, so its ARN is caller_arn.
-    expected = _denied_message(
+    expected = _expected_denial(ceiling_msg, _denied_message(
         caller_arn, UNGRANTABLE_ACTION, SESSION_POLICY, f"arn:{partition}:iam::{account}:role/"
-    )
+    ))
     assert ceiling_msg == expected, (
         f"{UNGRANTABLE_ACTION} is granted on the role, so the only thing that can still refuse it "
         f"is the injected session policy: expected {expected!r}, got {ceiling_msg!r}"

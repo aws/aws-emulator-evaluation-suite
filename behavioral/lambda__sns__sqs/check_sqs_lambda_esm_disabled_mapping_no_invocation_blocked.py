@@ -231,7 +231,7 @@ def _create_forwarder_function(ctx, role_arn, sink_queue_url=None, extra_env=Non
     # An invoked function auto-creates /aws/lambda/<name> on first invocation; it outlives the
     # function, so delete it.
     ctx.on_cleanup(
-        lambda: ctx.client("logs").delete_log_group(logGroupName=f"/aws/lambda/{name}")
+        lambda: _delete_function_log_group(ctx, f"/aws/lambda/{name}")
     )
     _poll_until(
         lambda: lam.get_function(FunctionName=name)["Configuration"]["State"],
@@ -266,6 +266,15 @@ def _drain_sink(ctx, sink_url, wait_s=2) -> list:
         out.append(json.loads(m["Body"]))
         sqs.delete_message(QueueUrl=sink_url, ReceiptHandle=m["ReceiptHandle"])
     return out
+
+
+def _delete_function_log_group(ctx, name: str) -> None:
+    """Delete a function's log group, which exists only once the function has written a log line."""
+    logs = ctx.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=name)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
 
 
 if __name__ == "__main__":

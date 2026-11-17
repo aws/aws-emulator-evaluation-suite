@@ -11,8 +11,7 @@ import os
 import re
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
-from urllib.parse import urlparse, urlsplit, urlunsplit
+from urllib.parse import urlparse, urlsplit
 
 import botocore
 import botocore.session
@@ -108,6 +107,10 @@ _AUTHORITY_RE = re.compile(
 
 #: A path escape that decodes to a space, a printable or a non-ASCII byte, never a control.
 _PATH_ESCAPE_RE = re.compile(r"%(?:[2-6][0-9A-Fa-f]|7[0-9A-Ea-e]|[89A-Fa-f][0-9A-Fa-f])")
+
+#: The schemes a published data-plane address is dialed with, and those of them without TLS.
+DIALED_SCHEMES = ("http", "https", "ws", "wss", "rtmp", "rtmps")
+_PLAIN_SCHEMES = ("http", "ws", "rtmp")
 
 
 def validate_endpoint(
@@ -283,14 +286,14 @@ def assert_tls_verification_permitted(endpoint: str, verify_ssl: bool | str) -> 
     """Refuse disabled TLS verification for a TLS endpoint that is not loopback.
 
     ``verify_ssl`` is requests' ``verify``: a non-empty str is a CA bundle, allowed anywhere. With
-    it disabled, the URL first passes :func:`validate_endpoint`; ``http`` and ``ws`` carry no
-    certificate to verify.
+    it disabled, the URL first passes :func:`validate_endpoint`; ``http``, ``ws`` and ``rtmp``
+    carry no certificate to verify.
     """
     if verify_ssl:
         return
     url = endpoint.split("?", 1)[0].split("#", 1)[0] if isinstance(endpoint, str) else endpoint
-    validate_endpoint(url, schemes=("http", "https", "ws", "wss"), path=True)
-    if urlsplit(endpoint).scheme.lower() in ("http", "ws"):
+    validate_endpoint(url, schemes=DIALED_SCHEMES, path=True)
+    if urlsplit(endpoint).scheme.lower() in _PLAIN_SCHEMES:
         return
     if not is_loopback_endpoint(endpoint):
         raise EndpointRefused(
@@ -313,71 +316,3 @@ def bearer_free_config(service: str) -> Config | None:
     """
     env = "AWS_BEARER_TOKEN_" + _signing_name(service).upper().replace("-", "_")
     return Config(auth_scheme_preference="sigv4") if os.environ.get(env) else None
-
-
-def fit_to_emulator(client: Any, endpoint: str) -> None:
-    """Fit ``client`` to the emulator at ``endpoint``.
-
-    Every request goes to its host (:func:`pin_endpoint_host`), and a directory bucket's control
-    calls go without an S3 Express session (:func:`_s3_express_control_operations`).
-    """
-    pin_endpoint_host(client, endpoint)
-    if client.meta.service_model.service_name == "s3":
-        for operation in _s3_express_control_operations():
-            client.meta.events.register_first(
-                f"choose-signer.s3.{operation}", _sign_without_session
-            )
-
-
-#: The signature version botocore signs an S3 Express request with, under a session.
-_S3_EXPRESS_SIGNER = "v4-s3express"
-
-
-@functools.cache
-def _s3_express_control_operations() -> frozenset[str]:
-    """The S3 operations AWS serves at the S3 Express control endpoint, signed without a session.
-
-    At a custom endpoint botocore's ruleset picks session signing for these too, so a directory
-    bucket's ``CreateBucket`` opens a session before the bucket exists; object calls keep theirs.
-    """
-    model = botocore.session.get_session().get_service_model("s3")
-    return frozenset(
-        name
-        for name in model.operation_names
-        if any(
-            p.name == "UseS3ExpressControlEndpoint" and p.value
-            for p in model.operation_model(name).static_context_parameters
-        )
-    )
-
-
-def _sign_without_session(signature_version: Any, **_: Any) -> str | None:
-    """SigV4 in place of S3 Express session signing, as AWS's control endpoint takes it."""
-    if isinstance(signature_version, str) and signature_version.startswith(_S3_EXPRESS_SIGNER):
-        return "s3v4" + signature_version[len(_S3_EXPRESS_SIGNER) :]
-    return None
-
-
-def pin_endpoint_host(client: Any, endpoint: str) -> None:
-    """Send ``client``'s requests to ``endpoint``'s scheme and authority, wherever a ruleset aims.
-
-    A ruleset may ignore a custom endpoint (signin's control plane) or prepend a label to it (S3
-    Control's ``{AccountId}.``); emulators route on the signing name, X-Amz-Target and path. A
-    named endpoint keeps the label; no resolver answers a name built on an IP literal.
-    """
-    want = urlsplit(endpoint)
-    try:
-        ipaddress.ip_address(want.hostname or "")
-        keeps_labels = False
-    except ValueError:
-        keeps_labels = True
-
-    def pin(request: Any, **_: Any) -> None:
-        url = urlsplit(request.url)
-        if url.scheme == want.scheme and (
-            url.netloc == want.netloc or (keeps_labels and url.netloc.endswith("." + want.netloc))
-        ):
-            return
-        request.url = urlunsplit(url._replace(scheme=want.scheme, netloc=want.netloc))
-
-    client.meta.events.register_first("before-sign", pin)

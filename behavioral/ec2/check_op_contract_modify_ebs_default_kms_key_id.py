@@ -1,6 +1,7 @@
 """op-contract-modify-ebs-default-kms-key-id."""
 from __future__ import annotations
 
+import time
 
 from behavioral_harness import tags
 from botocore.exceptions import ClientError
@@ -28,7 +29,7 @@ def run(ctx) -> None:
 
     original_key = ec2.get_ebs_default_kms_key_id()["KmsKeyId"]
 
-    ctx.on_cleanup(lambda: _restore_default_key(ec2, kms, original_key))
+    ctx.on_cleanup(lambda: _restore_default_key(ec2, kms, original_key, key_arn))
 
     # --- error boundary: DryRun must reject before changing the default key ---
     code, msg = _error(lambda: ec2.modify_ebs_default_kms_key_id(KmsKeyId=key_arn, DryRun=True))
@@ -78,13 +79,22 @@ def _error(fn):
     raise AssertionError(f"expected a ClientError, but the call succeeded and returned {result!r}")
 
 
-def _restore_default_key(ec2, kms, original: str) -> None:
-    """Point the account's default EBS key back at ``original``; the AWS managed key is a reset."""
+def _restore_default_key(ec2, kms, original: str, key_arn: str, timeout_s: float = 20.0) -> None:
+    """Point the account's default EBS key back at ``original``; the AWS managed key is a reset.
+
+    Waits until the default no longer names ``key_arn``, so the key is retired after it.
+    """
     managed = kms.describe_key(KeyId="alias/aws/ebs")["KeyMetadata"]["Arn"]
     if original == managed or original.endswith(":alias/aws/ebs"):
         ec2.reset_ebs_default_kms_key_id()
     else:
         ec2.modify_ebs_default_kms_key_id(KmsKeyId=original)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if ec2.get_ebs_default_kms_key_id()["KmsKeyId"] != key_arn:
+            return
+        time.sleep(2.0)
+    raise AssertionError(f"the default EBS key still names {key_arn} {timeout_s}s after restore")
 
 
 def _schedule_key_deletion(kms, key_id: str) -> None:

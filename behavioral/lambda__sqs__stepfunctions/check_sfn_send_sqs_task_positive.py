@@ -6,6 +6,8 @@ import json
 import time
 from typing import Any
 
+from botocore.exceptions import ClientError
+
 from behavioral_harness import tags
 
 CHECK = "sfn-send-sqs-task-positive"
@@ -111,7 +113,8 @@ def run(ctx) -> None:
         RoleName=role_name, AssumeRolePolicyDocument=trust, Tags=_xsvc_tags_kv()
     )
     role_arn = role["Role"]["Arn"]
-    ctx.on_cleanup(lambda: ctx.client("iam").delete_role(RoleName=role_name))
+    # the role holds an inline policy, which must go before the role
+    ctx.on_cleanup(lambda: _delete_role(ctx, role_name))
 
     policy_doc = json.dumps(
         {
@@ -271,6 +274,30 @@ def _wait_for_messages(ctx, queue_url, expected_count=1, timeout_s=60.0, delete=
             f"Expected {expected_count} messages, got {len(messages)} within {timeout_s}s"
         )
     return messages
+
+
+def _delete_role(ctx, role_name: str) -> None:
+    """IAM roles need every attached + inline policy removed before deletion."""
+    iam = ctx.client("iam")
+    try:
+        for p in iam.list_attached_role_policies(RoleName=role_name).get(
+            "AttachedPolicies", []
+        ):
+            iam.detach_role_policy(RoleName=role_name, PolicyArn=p["PolicyArn"])
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "NoSuchEntity":
+            raise
+    try:
+        for pname in iam.list_role_policies(RoleName=role_name).get("PolicyNames", []):
+            iam.delete_role_policy(RoleName=role_name, PolicyName=pname)
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "NoSuchEntity":
+            raise
+    try:
+        iam.delete_role(RoleName=role_name)
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "NoSuchEntity":
+            raise
 
 
 if __name__ == "__main__":

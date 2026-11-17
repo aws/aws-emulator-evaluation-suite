@@ -153,7 +153,7 @@ def _create_function(ctx: Any, role_arn: str, code: str, timeout: int = 30) -> s
     ctx.on_cleanup(lambda: lam.delete_function(FunctionName=name))
     # create_function auto-creates /aws/lambda/<name> on first invoke; it outlives the function
     # and would otherwise be left behind, so delete it too.
-    ctx.on_cleanup(lambda: ctx.client("logs").delete_log_group(logGroupName=f"/aws/lambda/{name}"))
+    ctx.on_cleanup(lambda: _delete_function_log_group(ctx, f"/aws/lambda/{name}"))
     _wait_active(ctx, name)
     return name
 
@@ -178,6 +178,15 @@ def _create_queue(ctx: Any, attrs: dict | None = None) -> dict[str, str]:
     ctx.on_cleanup(lambda: sqs.delete_queue(QueueUrl=url))
     arn = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
     return {"url": url, "arn": arn}
+
+
+def _delete_function_log_group(ctx, name: str) -> None:
+    """Delete a function's log group, which exists only once the function has written a log line."""
+    logs = ctx.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=name)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
 
 
 if __name__ == "__main__":

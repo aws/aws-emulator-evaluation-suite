@@ -32,7 +32,7 @@ def run(ctx) -> None:
     group = ctx.unique_name("sim2real-logcmk-rt-")
     stream = "s1"
     logs.create_log_group(logGroupName=group, tags={"sim2real": CHECK})
-    ctx.on_cleanup(lambda: logs.delete_log_group(logGroupName=group))
+    ctx.on_cleanup(lambda: _delete_group_and_wait(logs, group))
     logs.create_log_stream(logGroupName=group, logStreamName=stream)
 
     _associate_with_retry(logs, ClientError, logGroupName=group, kmsKeyId=key_arn)
@@ -174,6 +174,18 @@ def _poll(probe, predicate, *, timeout_s: float, what: str, interval_s: float = 
         if time.monotonic() > deadline:
             raise AssertionError(f"timed out after {timeout_s}s waiting for {what}; last={last!r}")
         time.sleep(interval_s)
+
+
+def _delete_group_and_wait(logs, group: str, timeout_s: float = 30.0) -> None:
+    logs.delete_log_group(logGroupName=group)
+    # Wait until the group is gone: the key's teardown runs next.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        found = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"]
+        if not any(g["logGroupName"] == group for g in found):
+            return
+        time.sleep(2)
+    raise AssertionError(f"log group {group} still present after {timeout_s}s")
 
 
 if __name__ == "__main__":

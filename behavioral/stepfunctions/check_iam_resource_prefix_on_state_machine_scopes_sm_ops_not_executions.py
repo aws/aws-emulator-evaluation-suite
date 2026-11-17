@@ -89,8 +89,8 @@ def _delete_role(ctx, role_name: str) -> None:
 
 
 def _delete_state_machines(ctx, arns: list[str]) -> None:
-    """Issue DeleteStateMachine for every arn FIRST, then wait on all of them together: deletion is
-    asynchronous, and the cost of waiting on N machines is the max of their waits, not the sum."""
+    """Issue DeleteStateMachine for every arn FIRST, then wait on all of them together until each
+    is DELETING or gone: deletion is asynchronous, and the wait costs the slowest, not the sum."""
     sfn = ctx.client("stepfunctions")
     for arn in arns:
         try:
@@ -113,7 +113,8 @@ def _delete_state_machines(ctx, arns: list[str]) -> None:
         gone = set()
         for arn in pending:
             try:
-                sfn.describe_state_machine(stateMachineArn=arn)
+                if sfn.describe_state_machine(stateMachineArn=arn)["status"] == "DELETING":
+                    gone.add(arn)
             except ClientError as exc:
                 if exc.response["Error"]["Code"] != "StateMachineDoesNotExist":
                     raise
@@ -123,7 +124,7 @@ def _delete_state_machines(ctx, arns: list[str]) -> None:
             return
         if time.monotonic() >= deadline:
             raise AssertionError(
-                f"state machine(s) still present {budget_s}s after DeleteStateMachine: "
+                f"state machine(s) still ACTIVE {budget_s}s after DeleteStateMachine: "
                 f"{sorted(pending)!r}"
             )
         time.sleep(2)

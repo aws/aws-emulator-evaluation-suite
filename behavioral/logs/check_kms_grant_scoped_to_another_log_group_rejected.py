@@ -120,12 +120,19 @@ def _describe_group(logs: Any, name: str) -> dict | None:
     return None
 
 
-def _delete_group_if_present(logs: Any, name: str) -> None:
+def _delete_group_if_present(logs: Any, name: str, timeout_s: float = 30.0) -> None:
     try:
         logs.delete_log_group(logGroupName=name)
     except ClientError as exc:
         if exc.response["Error"]["Code"] != "ResourceNotFoundException":
             raise
+    # Wait until the group is gone: the key's teardown runs next.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if _describe_group(logs, name) is None:
+            return
+        time.sleep(2)
+    raise AssertionError(f"log group {name} still present after {timeout_s}s")
 
 
 def _read_events(logs: Any, group: str, stream: str, expected: int,

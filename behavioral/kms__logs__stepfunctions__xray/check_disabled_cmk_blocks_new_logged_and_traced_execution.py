@@ -53,7 +53,9 @@ def run(ctx) -> None:
 
     # --- The negative: disable the key; a start is refused once the cached data key lapses -
     kms.disable_key(KeyId=key["KeyId"])
-    state = kms.describe_key(KeyId=key["KeyId"])["KeyMetadata"]["KeyState"]
+    # Runs before the state machine's delete, which still uses the key in the background.
+    ctx.on_cleanup(lambda: kms.enable_key(KeyId=key["KeyId"]))
+    state =kms.describe_key(KeyId=key["KeyId"])["KeyMetadata"]["KeyState"]
     assert state == "Disabled", f"DisableKey must leave the key Disabled; it is {state!r}"
 
     deadline = time.monotonic() + _REUSE_S + 60.0
@@ -224,7 +226,7 @@ def _state_machine(ctx, sfn, role_arn: str, key_arn: str, group_arn: str) -> str
             last = exc
             time.sleep(2.0)
             continue
-        ctx.on_cleanup(lambda a=arn: sfn.delete_state_machine(stateMachineArn=a))
+        ctx.on_cleanup(lambda a=arn: _delete_state_machine(sfn, a))
         return arn
     raise AssertionError(f"CreateStateMachine still AccessDenied after 150s: {last!r}")
 
@@ -389,6 +391,20 @@ def _read_group(ctx, group: str) -> list[dict]:
         if not resp.get("nextToken"):
             return out
         kwargs["nextToken"] = resp["nextToken"]
+
+
+def _delete_state_machine(sfn, arn: str, timeout_s: float = 300.0) -> None:
+    """Delete a state machine, then poll until DescribeStateMachine no longer finds it."""
+    sfn.delete_state_machine(stateMachineArn=arn)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            # The service deletes in the background, still using the key.
+            sfn.describe_state_machine(stateMachineArn=arn, includedData="METADATA_ONLY")
+        except sfn.exceptions.StateMachineDoesNotExist:
+            return
+        time.sleep(2.0)
+    raise AssertionError(f"state machine {arn} still exists {timeout_s}s after DeleteStateMachine")
 
 
 if __name__ == "__main__":

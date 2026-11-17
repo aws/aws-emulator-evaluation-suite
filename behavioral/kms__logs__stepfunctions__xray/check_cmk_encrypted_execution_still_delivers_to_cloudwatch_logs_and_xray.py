@@ -197,7 +197,7 @@ def _state_machine(ctx, sfn, role_arn: str, key_arn: str, group_arn: str) -> str
             last = exc
             time.sleep(2.0)
             continue
-        ctx.on_cleanup(lambda a=arn: sfn.delete_state_machine(stateMachineArn=a))
+        ctx.on_cleanup(lambda a=arn: _delete_state_machine(sfn, a))
         return arn
     raise AssertionError(f"CreateStateMachine still AccessDenied after 150s: {last!r}")
 
@@ -316,6 +316,20 @@ def _await_trace(xray, root: str) -> dict:
         f"X-Ray never returned trace {root} within {_XRAY_BUDGET_S}s; "
         f"UnprocessedTraceIds was {unprocessed}"
     )
+
+
+def _delete_state_machine(sfn, arn: str, timeout_s: float = 300.0) -> None:
+    """Delete a state machine, then poll until DescribeStateMachine no longer finds it."""
+    sfn.delete_state_machine(stateMachineArn=arn)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            # The service deletes in the background, still using the key.
+            sfn.describe_state_machine(stateMachineArn=arn, includedData="METADATA_ONLY")
+        except sfn.exceptions.StateMachineDoesNotExist:
+            return
+        time.sleep(2.0)
+    raise AssertionError(f"state machine {arn} still exists {timeout_s}s after DeleteStateMachine")
 
 
 if __name__ == "__main__":

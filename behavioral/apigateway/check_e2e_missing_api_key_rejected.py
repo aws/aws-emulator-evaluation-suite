@@ -67,7 +67,7 @@ def run(ctx) -> None:
         apiStages=[{"apiId": api_id, "stage": stage_name}],
     )
     plan_id = plan["id"]
-    ctx.on_cleanup(lambda: _delete_usage_plan_ignore_missing(apigw, plan_id))
+    ctx.on_cleanup(lambda: _delete_usage_plan_ignore_missing(apigw, plan_id, api_id, stage_name))
     apigw.create_usage_plan_key(usagePlanId=plan_id, keyId=key_id, keyType="API_KEY")
 
     url = f"{ctx.rest_api_url(api_id, stage_name)}/hello"
@@ -151,12 +151,18 @@ def _delete_api_key_ignore_missing(apigw, key_id: str) -> None:
             raise
 
 
-def _delete_usage_plan_ignore_missing(apigw, plan_id: str) -> None:
-    try:
-        apigw.delete_usage_plan(usagePlanId=plan_id)
-    except ClientError as exc:
-        if exc.response["Error"]["Code"] != "NotFoundException":
-            raise
+def _delete_usage_plan_ignore_missing(apigw, plan_id: str, api_id: str, stage_name: str) -> None:
+    """Detach the plan's API stage, then delete the plan, which AWS refuses while it has one."""
+    detach = [{"op": "remove", "path": "/apiStages", "value": f"{api_id}:{stage_name}"}]
+    for call in (
+        lambda: apigw.update_usage_plan(usagePlanId=plan_id, patchOperations=detach),
+        lambda: apigw.delete_usage_plan(usagePlanId=plan_id),
+    ):
+        try:
+            call()
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "NotFoundException":
+                raise
 
 
 if __name__ == "__main__":

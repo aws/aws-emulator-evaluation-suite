@@ -353,7 +353,7 @@ def _create_state_machine(ctx, sm_type: str) -> dict[str, str]:
 
 
 def _delete_state_machine_and_wait(ctx, arn: str, timeout_s: float = 180.0) -> None:
-    """DeleteStateMachine is asynchronous; wait until DescribeStateMachine reports it gone."""
+    """DeleteStateMachine is asynchronous; wait until the machine is DELETING or gone."""
     sfn = ctx.client("stepfunctions")
     try:
         sfn.delete_state_machine(stateMachineArn=arn)
@@ -364,13 +364,16 @@ def _delete_state_machine_and_wait(ctx, arn: str, timeout_s: float = 180.0) -> N
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         try:
-            sfn.describe_state_machine(stateMachineArn=arn)
+            if sfn.describe_state_machine(stateMachineArn=arn)["status"] == "DELETING":
+                return
         except ClientError as exc:
             if exc.response["Error"]["Code"] != "StateMachineDoesNotExist":
                 raise
             return
         time.sleep(2)
-    raise TimeoutError(f"state machine {arn} still exists {timeout_s:.0f}s after DeleteStateMachine")
+    raise TimeoutError(
+        f"state machine {arn} still ACTIVE {timeout_s:.0f}s after DeleteStateMachine"
+    )
 
 
 def _create_pipe(ctx, *, source: str, target: str, role_arn: str, **extra) -> str:

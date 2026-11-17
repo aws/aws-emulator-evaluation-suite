@@ -95,6 +95,19 @@ def _wait_searchable(osc, domain: str, timeout_s: float = 1800) -> str:
     raise AssertionError(detail)
 
 
+def _delete_domain(osc, domain: str, timeout_s: float = 1500) -> None:
+    """Delete the domain and wait until it is gone, so its KMS key is retired after it."""
+    osc.delete_domain(DomainName=domain)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:  # the domain deletes in the background
+        try:
+            osc.describe_domain(DomainName=domain)
+        except osc.exceptions.ResourceNotFoundException:
+            return
+        time.sleep(20)
+    raise AssertionError(f"domain {domain} still deleting {timeout_s}s after its delete")
+
+
 def _all_grants(kms, key_id: str) -> list:
     grants, marker = [], None
     while True:
@@ -146,7 +159,7 @@ def run(ctx) -> None:
         AccessPolicies=_account_policy(account_id, ctx.region, domain),
         TagList=[{"Key": "sim2real:managed", "Value": "true"}],
     )
-    ctx.on_cleanup(lambda: osc.delete_domain(DomainName=domain))
+    ctx.on_cleanup(lambda: _delete_domain(osc, domain))
 
     ear = created.get("EncryptionAtRestOptions") or {}
     assert ear.get("Enabled") is True and ear.get("KmsKeyId") == key_arn, (

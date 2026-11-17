@@ -122,12 +122,20 @@ def _create_volume(ctx, ec2, zone, key_arn):
 
 
 def _delete_volume(ec2, vid):
-    """Delete the volume; one EC2 has already withdrawn (InvalidVolume.NotFound) is already gone."""
+    """Delete the volume and wait until it is gone.
+
+    One EC2 has already withdrawn (InvalidVolume.NotFound) is already gone.
+    """
     try:
         ec2.delete_volume(VolumeId=vid)
     except ClientError as exc:
         if exc.response.get("Error", {}).get("Code") != "InvalidVolume.NotFound":
             raise
+        return
+    # the volume deletes in the background, still using its key
+    ec2.get_waiter("volume_deleted").wait(
+        VolumeIds=[vid], WaiterConfig={"Delay": 5, "MaxAttempts": 24}
+    )
 
 
 def _volume_state(ec2, vid):

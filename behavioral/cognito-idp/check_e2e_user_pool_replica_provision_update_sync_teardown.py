@@ -227,14 +227,14 @@ _REPLICAS_LEFT = (
 
 
 def _delete_pool(cognito, pool_id, cleanup_deadline: dict) -> None:
-    """Delete the pool; retry while a deleted replica is still attached, return if already gone."""
+    """Delete the pool; retry while a deleted replica is still attached, return once it is gone."""
     from botocore.exceptions import ClientError
 
     deadline = cleanup_deadline.setdefault("t", time.monotonic() + _CLEANUP_S - _CLEANUP_HEADROOM_S)
     while True:
         try:
             cognito.delete_user_pool(UserPoolId=pool_id)
-            return
+            break
         except ClientError as exc:
             error = exc.response["Error"]
             if error["Code"] == "ResourceNotFoundException":
@@ -243,6 +243,13 @@ def _delete_pool(cognito, pool_id, cleanup_deadline: dict) -> None:
             if not refused or time.monotonic() >= deadline:
                 raise
         time.sleep(2)
+    while time.monotonic() < deadline:  # the pool deletes in the background
+        try:
+            cognito.describe_user_pool(UserPoolId=pool_id)
+        except cognito.exceptions.ResourceNotFoundException:
+            return
+        time.sleep(2)
+    raise RuntimeError(f"user pool {pool_id} still present within the cleanup budget")
 
 
 def _client_error(fn):

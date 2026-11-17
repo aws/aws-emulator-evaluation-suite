@@ -145,15 +145,12 @@ _MANAGED_TAG_KEY = "sim2real:managed"
 
 
 def _stop_and_delete_state_machine(ctx, arn: str) -> None:
-    """Delete a Step Functions state machine synchronously.
+    """Delete a Step Functions state machine and wait until it reports DELETING or is gone.
 
-    A plain ``delete_state_machine`` fires and moves on, but SFN deletion is
-    asynchronous: the state machine lingers in DELETING (and stays visible to the
-    account audit) — indefinitely if it still has a RUNNING execution (e.g. a
-    waitForTaskToken task nobody resumed). Stop any running executions first, then
-    wait until the state machine is actually gone. Registered via ``on_cleanup``
-    AFTER the state machine is created so LIFO runs it BEFORE the plain
-    delete_state_machine teardown that ``create_state_machine`` registered.
+    SFN deletion is asynchronous, and a machine with a RUNNING execution (a
+    waitForTaskToken task nobody resumed) does not finish deleting while it runs, so
+    running executions are stopped first. Registered via ``on_cleanup`` AFTER the machine
+    is created, so LIFO runs it BEFORE the plain delete the creation registered.
     """
     sfn = ctx.client("stepfunctions")
     try:
@@ -173,13 +170,14 @@ def _stop_and_delete_state_machine(ctx, arn: str) -> None:
     deadline = time.monotonic() + 210
     while time.monotonic() < deadline:
         try:
-            sfn.describe_state_machine(stateMachineArn=arn)
+            if sfn.describe_state_machine(stateMachineArn=arn)["status"] == "DELETING":
+                return
         except ClientError as exc:
             if exc.response["Error"]["Code"] != "StateMachineDoesNotExist":
                 raise
             return
         time.sleep(2)
-    raise RuntimeError(f"state machine {arn} still exists 210 s after DeleteStateMachine")
+    raise RuntimeError(f"state machine {arn} still ACTIVE 210 s after DeleteStateMachine")
 
 
 def _xsvc_resource_tags() -> dict[str, str]:

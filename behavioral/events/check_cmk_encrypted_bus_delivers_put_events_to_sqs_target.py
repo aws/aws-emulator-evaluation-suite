@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import time
 
+from botocore.exceptions import ClientError
+
 from behavioral_harness import tags
 
 CHECK = "cmk-encrypted-bus-delivers-put-events-to-sqs-target"
@@ -28,7 +30,7 @@ def run(ctx) -> None:
     created = events.create_event_bus(
         Name=bus, KmsKeyIdentifier=key_arn, Tags=[{"Key": "sim2real", "Value": CHECK}]
     )
-    ctx.on_cleanup(lambda: events.delete_event_bus(Name=bus))
+    ctx.on_cleanup(lambda: _delete_bus_and_wait(events, bus))
     assert created["EventBusArn"] == bus_arn, (
         f"CreateEventBus returned ARN {created['EventBusArn']!r}, expected {bus_arn!r}"
     )
@@ -142,6 +144,21 @@ def _poll_for_marker(ctx, queue_url: str, marker: str) -> dict:
         f"the event put to the CMK-encrypted bus never reached the SQS target within "
         f"{_DELIVERY_TIMEOUT_S}s ({seen} unrelated messages seen)"
     )
+
+
+def _delete_bus_and_wait(events, bus: str, timeout_s: float = 30.0) -> None:
+    events.delete_event_bus(Name=bus)
+    # Wait until the bus is gone: the key's teardown runs next.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            events.describe_event_bus(Name=bus)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ResourceNotFoundException":
+                return
+            raise
+        time.sleep(2)
+    raise AssertionError(f"event bus {bus} still present after {timeout_s}s")
 
 
 if __name__ == "__main__":

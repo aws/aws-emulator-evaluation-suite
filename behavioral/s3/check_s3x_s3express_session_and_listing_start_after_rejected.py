@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from botocore.exceptions import ClientError
 
+from botocore.config import Config
 from behavioral_harness import tags
 
 
@@ -26,6 +27,11 @@ _S3EXPRESS_AZ_IDS = {
     "eu-west-1": ["euw1-az1", "euw1-az3"],
     "eu-north-1": ["eun1-az1", "eun1-az2", "eun1-az3"],
 }
+
+
+def _s3_control(ctx):
+    """S3 for a directory bucket's control calls, which AWS serves without an S3 Express session."""
+    return ctx.client("s3", config=Config(s3={"disable_s3_express_session_auth": True}))
 
 
 def _err(fn):
@@ -62,7 +68,7 @@ def _directory_bucket(ctx, s3, prefix):
     for az in azs:
         name = f"{base}--{az}--x-s3"
         try:
-            s3.create_bucket(
+            _s3_control(ctx).create_bucket(
                 Bucket=name,
                 CreateBucketConfiguration={
                     "Location": {"Type": "AvailabilityZone", "Name": az},
@@ -84,7 +90,7 @@ def _general_purpose_bucket(ctx, s3, prefix):
     params = {"Bucket": name}
     if ctx.region != "us-east-1":
         params["CreateBucketConfiguration"] = {"LocationConstraint": ctx.region}
-    s3.create_bucket(**params)
+    _s3_control(ctx).create_bucket(**params)
     ctx.on_cleanup(lambda: _empty_and_delete(s3, name))
     return name
 

@@ -48,6 +48,8 @@ def run(ctx) -> None:
     assert status == "PUBLISHING", f"expected PUBLISHING, got {status}"
 
     key_arn_2 = _create_guardduty_kms_key(ctx, account_id, detector_arn)
+    # The second key's teardown must run after the destination is gone too.
+    ctx.on_cleanup(lambda: _safe_delete_destination(gd, detector_id, destination_id))
     gd.update_publishing_destination(
         DetectorId=detector_id,
         DestinationId=destination_id,
@@ -253,13 +255,27 @@ def _wait_for_error(call, *, timeout_s=90.0, interval_s=5.0):
     raise AssertionError(f"call never failed within {timeout_s}s")
 
 
-def _safe_delete_destination(gd, detector_id, destination_id):
+def _safe_delete_destination(gd, detector_id, destination_id, timeout_s=30.0):
+    """Delete the destination and wait until it reads as gone, so its keys are retired after it."""
     try:
         gd.delete_publishing_destination(DetectorId=detector_id, DestinationId=destination_id)
     except ClientError as exc:
         # GuardDuty reports a publishing destination that is already gone as BadRequestException.
         if exc.response["Error"]["Code"] != "BadRequestException":
             raise
+        return
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:  # the destination deletes in the background
+        try:
+            gd.describe_publishing_destination(DetectorId=detector_id, DestinationId=destination_id)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "BadRequestException":
+                return
+            raise
+        time.sleep(3)
+    raise AssertionError(
+        f"publishing destination {destination_id} still present {timeout_s}s after its delete"
+    )
 
 
 if __name__ == "__main__":

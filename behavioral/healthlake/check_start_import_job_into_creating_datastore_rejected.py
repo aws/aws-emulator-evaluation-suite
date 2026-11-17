@@ -103,7 +103,7 @@ def run(ctx) -> None:
     assert created_ds["DatastoreStatus"] == "CREATING", (
         f"expected a freshly created datastore to be CREATING, got {created_ds['DatastoreStatus']!r}"
     )
-    ctx.on_cleanup(lambda: _best_effort(lambda: healthlake.delete_fhir_datastore(DatastoreId=datastore_id)))
+    ctx.on_cleanup(lambda: _best_effort(lambda: _delete_datastore(healthlake, datastore_id)))
 
     # Rejected while CREATING -- with AccessDeniedException, not ValidationException: this is
     # HealthLake's deterministic answer for "datastore is not active", not an IAM-propagation
@@ -157,6 +157,22 @@ def run(ctx) -> None:
     assert job_props["JobStatus"] == "COMPLETED", (
         f"import job ended as {job_props['JobStatus']}: {job_props.get('Message')}"
     )
+
+
+def _delete_datastore(healthlake, datastore_id, timeout_s=780.0):
+    """Delete the datastore and wait until it is DELETED, so the job's key is retired after it."""
+    healthlake.delete_fhir_datastore(DatastoreId=datastore_id)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:  # the datastore deletes in the background
+        try:
+            got = healthlake.describe_fhir_datastore(DatastoreId=datastore_id)
+            props = got["DatastoreProperties"]
+        except healthlake.exceptions.ResourceNotFoundException:
+            return
+        if props["DatastoreStatus"] == "DELETED":
+            return
+        time.sleep(15.0)
+    raise AssertionError(f"datastore {datastore_id} still deleting {timeout_s}s after its delete")
 
 
 def _best_effort(fn):

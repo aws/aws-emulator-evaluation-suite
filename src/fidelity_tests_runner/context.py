@@ -11,8 +11,10 @@ A URL or host the emulator published is used as published, as a customer of the 
 one no such customer can use (``published.OwnHosts.problem``) fails the test with
 ``PublishedUrlRejected`` before anything is dialed. Every URL and host the context hands a test,
 or builds a client for, is also on this machine, a private address, or the emulator's own host
-(``target.require_local_host``); anything else raises ``NonLocalHostRefused``. Tools and
-containers a test starts are not limited this way.
+(``target.require_local_host``); anything else raises ``NonLocalHostRefused``. A client sends
+each request where the customer's SDK sends it, and one aimed at a host the emulator does not
+serve fails the test with ``CapabilityNotOffered`` before it is sent. Tools and containers a test
+starts are not limited this way.
 """
 
 import hashlib
@@ -39,16 +41,18 @@ from fidelity_tests_runner.published import (
     OwnHosts,
     PublishedUrlRejected,
     host_pattern,
+    name_under_ip,
     own_host_entries,
     under_partition,
     value_class,
 )
 from fidelity_tests_runner.target import (
+    DIALED_SCHEMES,
     EndpointRefused,
     NonLocalHostRefused,
     assert_tls_verification_permitted,
     bearer_free_config,
-    fit_to_emulator,
+    is_local_host,
     is_loopback_endpoint,
     refuse_real_aws,
     require_local_host,
@@ -65,8 +69,6 @@ NO_HOST_PREFIX_ENV = "AWS_DISABLE_HOST_PREFIX_INJECTION"
 _SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
 _WEBSOCKET_SCHEME = {"http": "ws", "https": "wss"}
 _PLAIN = {"ws": "http", "wss": "https"}
-#: The schemes a published data-plane URL is dialed with.
-_DIALED = ("http", "https", "ws", "wss")
 #: The family a published URL's scheme is graded by: ``https`` is ``http``, ``wss`` is ``ws``.
 _SCHEME_FAMILY = {"https": "http", "wss": "ws", "rediss": "redis", "postgres": "postgresql"}
 #: What a bare host never holds: a scheme or port (`:`), a path, a query, a fragment, userinfo,
@@ -130,6 +132,30 @@ _S3_WEBSITE_FIELDS = frozenset({"bucket", "region", "host", "port"})
 
 class CapabilityNotOffered(AssertionError):
     """The emulator offers no equivalent of an AWS data plane a test needs: the test fails."""
+
+
+def _refuse_unserved_hosts(client: Any, endpoint: str, own_hosts: Iterable[str]) -> None:
+    """Make ``client`` refuse, before sending it, a request to a host the emulator does not serve.
+
+    A request goes where the customer's SDK sends it, and an endpoint ruleset may aim it off the
+    endpoint (signin's control plane) or put a label before it (S3 Control's and CloudFront
+    KeyValueStore's ``{AccountId}.``). A host that is not local (``target.is_local_host`` with the
+    run's ``own_hosts``) or is a name under an IP literal, which no resolver answers, raises
+    ``CapabilityNotOffered``: the emulator serves no address the call needs, so the test fails and
+    the request never leaves this machine.
+    """
+
+    def refuse(request: Any, **_: Any) -> None:
+        try:
+            host = urlsplit(request.url).hostname or ""
+        except ValueError:
+            host = ""
+        if not host or name_under_ip(host) or not is_local_host(host, endpoint, own_hosts):
+            raise CapabilityNotOffered(
+                f"the emulator serves no address for {host or repr(request.url)}"
+            )
+
+    client.meta.events.register_first("before-send", refuse)
 
 
 def s3_website_template(template: str | None) -> str | None:
@@ -522,17 +548,29 @@ class Context:
         return [url]
 
     def endpoint_url(
-        self, published: str, *, websocket: bool = False, aws_port: int | None = None
+        self,
+        published: str,
+        *,
+        websocket: bool = False,
+        aws_port: int | None = None,
+        scheme: str | None = None,
     ) -> str:
         """The URL of a data-plane endpoint the emulator published in a control-plane response.
 
-        A bare host takes the emulator endpoint's scheme; a value with a scheme keeps it,
-        ``websocket`` mapping http(s) to ws(s).
+        A bare host takes ``scheme`` (``rtmps`` for a media ingest host), else the emulator
+        endpoint's scheme; a value with a scheme keeps it, ``websocket`` mapping http(s) to ws(s).
         """
-        return self.endpoint_route(published, websocket=websocket, aws_port=aws_port)[0]
+        return self.endpoint_route(
+            published, websocket=websocket, aws_port=aws_port, scheme=scheme
+        )[0]
 
     def endpoint_route(
-        self, published: str, *, websocket: bool = False, aws_port: int | None = None
+        self,
+        published: str,
+        *,
+        websocket: bool = False,
+        aws_port: int | None = None,
+        scheme: str | None = None,
     ) -> tuple[str, dict[str, str]]:
         """``endpoint_url(published)`` and the headers a test sends with it, always none.
 
@@ -543,14 +581,16 @@ class Context:
         del aws_port  # AWS's port; an emulator's bare host is served on its own
         if not published or published != published.strip():
             raise ValueError(f"a published data-plane endpoint is empty or padded: {published!r}")
+        if scheme is not None and scheme not in DIALED_SCHEMES:
+            raise ValueError(f"a bare host's scheme is not one of {DIALED_SCHEMES}: {scheme!r}")
         if _SCHEME_RE.match(published):
             url = published
         else:
             secure = self._own.scheme == "https"
-            url = f"{'https' if secure else 'http'}://{published}"
-        scheme, sep, rest = url.partition("://")
-        if websocket and scheme.lower() in _WEBSOCKET_SCHEME:
-            url = f"{_WEBSOCKET_SCHEME[scheme.lower()]}{sep}{rest}"
+            url = f"{scheme or ('https' if secure else 'http')}://{published}"
+        given, sep, rest = url.partition("://")
+        if websocket and given.lower() in _WEBSOCKET_SCHEME:
+            url = f"{_WEBSOCKET_SCHEME[given.lower()]}{sep}{rest}"
         assert_tls_verification_permitted(url, self._verify_ssl)
         target = self._published_target(url, "endpoint_url")
         self._trust_listener(target)
@@ -563,7 +603,9 @@ class Context:
         (``target.require_local_host``).
         """
         if "://" in value:  # one host for every parser before any is graded
-            validate_endpoint(value.split("?", 1)[0].split("#", 1)[0], schemes=_DIALED, path=True)
+            validate_endpoint(
+                value.split("?", 1)[0].split("#", 1)[0], schemes=DIALED_SCHEMES, path=True
+            )
         if problem := self._own.problem(value):
             self._violation(field, value, problem[0])
             message = f"{field} was given {value} (published by the emulator or built by the test)"
@@ -763,7 +805,7 @@ class Context:
             verify=self._verify_ssl,
             **kw,
         )
-        fit_to_emulator(client, target)
+        _refuse_unserved_hosts(client, self._endpoint, self._own.entries)
         return client
 
     def subprocess_env(self) -> dict[str, str]:
@@ -785,12 +827,6 @@ class Context:
         env["AWS_ENDPOINT_URL_S3_FOR_CLOUDFORMATION"] = self._endpoint
         env["NODE_OPTIONS"] = f'--require "{_node_quoted(self._js_sdk_preload())}"'
         env[NO_HOST_PREFIX_ENV] = "true"  # the endpoint host as given, as ctx.client sends
-        # S3 Control's endpoint rules prepend "{AccountId}." to a custom endpoint, and an IP
-        # literal cannot take a label; *.localhost resolves to loopback for every IaC tool.
-        parts = urlsplit(self._endpoint)
-        if parts.hostname in ("127.0.0.1", "::1"):
-            netloc = f"localhost:{parts.port}" if parts.port else "localhost"
-            env["AWS_ENDPOINT_URL_S3_CONTROL"] = parts._replace(netloc=netloc).geturl()
         env["AWS_ACCESS_KEY_ID"] = self._creds["aws_access_key_id"]
         env["AWS_SECRET_ACCESS_KEY"] = self._creds["aws_secret_access_key"]
         if self._creds.get("aws_session_token"):

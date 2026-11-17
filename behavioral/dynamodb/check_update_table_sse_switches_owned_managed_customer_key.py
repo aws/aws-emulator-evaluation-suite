@@ -30,6 +30,9 @@ def _safe_delete_table(ddb, table_name):
     except ClientError as exc:
         if exc.response['Error']['Code'] != 'ResourceNotFoundException':
             raise
+        return
+    # DynamoDB deletes the table in the background, still using its key until it is gone.
+    ddb.get_waiter('table_not_exists').wait(TableName=table_name, WaiterConfig={'Delay': 2, 'MaxAttempts': 100})
 
 
 @tags("axis:happy-path", "cap:c1", "concern:representation", "plane:control")
@@ -77,6 +80,7 @@ def run(ctx) -> None:
     )['KeyMetadata']
     cmk_id = cmk['KeyId']
     ctx.on_cleanup(lambda: kms.schedule_key_deletion(KeyId=cmk_id, PendingWindowInDays=7))
+    ctx.on_cleanup(lambda: _safe_delete_table(ddb, table_name))
     assert cmk['KeyManager'] == 'CUSTOMER', f'expected a freshly created key to be CUSTOMER managed, got {cmk["KeyManager"]!r}'
 
     ddb.update_table(

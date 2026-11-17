@@ -239,9 +239,7 @@ def _create_function_with_retry(
             # The function auto-creates /aws/lambda/<name> on first invoke and that log group survives
             # function deletion, so delete it too.
             ctx.on_cleanup(
-                lambda: ctx.client("logs").delete_log_group(
-                    logGroupName=f"/aws/lambda/{name}"
-                )
+                lambda: _delete_function_log_group(ctx, f"/aws/lambda/{name}")
             )
             _wait_function_active(ctx, name)
             return {"name": name, "arn": resp["FunctionArn"]}
@@ -388,6 +386,15 @@ def _wire_event_source(
         description=f"ESM {esm_uuid} Enabled",
     )
     return esm_uuid
+
+
+def _delete_function_log_group(ctx, name: str) -> None:
+    """Delete a function's log group, which exists only once the function has written a log line."""
+    logs = ctx.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=name)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
 
 
 if __name__ == "__main__":

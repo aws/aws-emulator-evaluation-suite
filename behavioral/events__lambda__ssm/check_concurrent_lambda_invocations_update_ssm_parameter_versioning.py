@@ -270,9 +270,7 @@ def _create_function_with_retry(
             ctx.on_cleanup(lambda: lam.delete_function(FunctionName=name))
             # The /aws/lambda/<name> log group created on first invoke survives function deletion.
             ctx.on_cleanup(
-                lambda: ctx.client("logs").delete_log_group(
-                    logGroupName=f"/aws/lambda/{name}"
-                )
+                lambda: _delete_function_log_group(ctx, f"/aws/lambda/{name}")
             )
             _wait_function_active(ctx, name)
             return {"name": name, "arn": resp["FunctionArn"]}
@@ -360,6 +358,15 @@ def _invoke_lambda_with_retry(
         time.sleep(2)
         result = _invoke_lambda(ctx, name, payload)
     return result
+
+
+def _delete_function_log_group(ctx, name: str) -> None:
+    """Delete a function's log group, which exists only once the function has written a log line."""
+    logs = ctx.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=name)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
 
 
 if __name__ == "__main__":

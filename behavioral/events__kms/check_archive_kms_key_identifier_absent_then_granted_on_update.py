@@ -27,7 +27,7 @@ def run(ctx) -> None:
 
     archive = ctx.unique_name("sim2real-behav-archive-")
     events.create_archive(ArchiveName=archive, EventSourceArn=bus_arn)
-    ctx.on_cleanup(lambda: events.delete_archive(ArchiveName=archive))
+    ctx.on_cleanup(lambda: _delete_archive_and_wait(events, archive))
     _await_state(events, archive, "ENABLED")
     desc = events.describe_archive(ArchiveName=archive)
     assert "KmsKeyIdentifier" not in desc, (
@@ -54,6 +54,7 @@ def run(ctx) -> None:
 
     # --- UpdateArchive with a key EventBridge may use succeeds, and DescribeArchive reports it. ---
     events.update_archive(ArchiveName=archive, KmsKeyIdentifier=granted_key)
+    ctx.on_cleanup(lambda: _delete_archive_and_wait(events, archive))
     _await_state(events, archive, "ENABLED")
     desc = events.describe_archive(ArchiveName=archive)
     assert desc.get("KmsKeyIdentifier") == granted_key, (
@@ -97,6 +98,27 @@ def _await_state(events, archive: str, state: str, *, timeout_s: float = 60.0) -
             raise AssertionError(f"archive {archive} reached CREATE_FAILED: {last.get('StateReason')!r}")
         time.sleep(2)
     raise AssertionError(f"archive {archive} never reached {state} in {timeout_s}s: {last!r}")
+
+
+def _delete_archive_and_wait(events, archive: str, timeout_s: float = 45.0) -> None:
+    try:
+        events.delete_archive(ArchiveName=archive)
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ResourceNotFoundException":
+            raise
+        return
+    # Wait until the archive is gone: the service deletes in the background and the key's
+    # teardown runs next.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            events.describe_archive(ArchiveName=archive)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ResourceNotFoundException":
+                return
+            raise
+        time.sleep(2)
+    raise AssertionError(f"archive {archive} still present after {timeout_s}s")
 
 
 def _error(fn) -> tuple[str, str]:

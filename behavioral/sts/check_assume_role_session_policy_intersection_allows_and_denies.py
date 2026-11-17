@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 
 from botocore.exceptions import ClientError
@@ -13,6 +14,23 @@ GROUP = 'overly-permissive'
 SERVICES = ['sts']
 # What an error-code helper returns when the call succeeds: equal to no AWS error code.
 _OK = "(no error: the call succeeded)"
+
+
+# IAM ends a denial with a pointer to a per-request authorization id, given twice (in a console URL
+# and on its own); every other character is graded.
+_AUTHZ_TAIL = (
+    r"\. Go to https://[a-z0-9-]+\.console\.aws\.amazon\.com/iam/home\?region=[a-z0-9-]+"
+    r"#/authorization-details/(\w+) for complete details, or call the "
+    r"GetRequestAuthorizationDetails API with the following authorization id: \1"
+)
+
+
+def _expected_denial(message, head):
+    """``head`` followed by the authorization-details pointer that ends ``message``: the pointer's
+    region and per-request authorization id are the only parts read back from it."""
+    found = re.search(_AUTHZ_TAIL + r"\Z", message or "")
+    return head + (found.group(0) if found else ". Go to <authorization-details pointer>")
+
 
 @tags("axis:rejection", "cap:c7", "concern:negative-classes", "plane:control")
 def run(ctx) -> None:
@@ -247,11 +265,11 @@ def run(ctx) -> None:
         message = exc.response["Error"].get("Message")
     else:
         raise AssertionError("iam:ListRoles succeeded for the scoped session after it was refused")
-    expected = (
+    expected = _expected_denial(message, (
         f"User: {scoped['AssumedRoleUser']['Arn']} is not authorized to perform: iam:ListRoles on "
         f"resource: arn:aws:iam::{_account_id()}:role/ because no session policy allows the "
         "iam:ListRoles action"
-    )
+    ))
     assert message == expected, f"expected message {expected!r}, got {message!r}"
 
     # (c) the narrowing is scoped to the one session, not to the role.

@@ -3,11 +3,17 @@ from __future__ import annotations
 
 from botocore.exceptions import ClientError
 
+from botocore.config import Config
 from behavioral_harness import tags
 
 CHECK = "list-directory-buckets-isolation"
 GROUP = "state-machine"
 SERVICES = ["s3"]
+
+
+def _s3_control(ctx):
+    """S3 for a directory bucket's control calls, which AWS serves without an S3 Express session."""
+    return ctx.client("s3", config=Config(s3={"disable_s3_express_session_auth": True}))
 
 
 @tags("axis:happy-path", "cap:c1", "concern:representation", "plane:control")
@@ -16,7 +22,7 @@ def run(ctx) -> None:
     s3 = ctx.client("s3")
     gp_bucket = ctx.unique_name("sim2real-gp-")
     _create_bucket(s3, ctx, gp_bucket)
-    ctx.on_cleanup(lambda: s3.delete_bucket(Bucket=gp_bucket))
+    ctx.on_cleanup(lambda: _s3_control(ctx).delete_bucket(Bucket=gp_bucket))
 
     dir_bucket = _create_directory_bucket(ctx)
 
@@ -24,7 +30,7 @@ def run(ctx) -> None:
     assert gp_bucket in gp_listed, f"expected {gp_bucket} in ListBuckets output"
     assert dir_bucket not in gp_listed, f"directory bucket {dir_bucket} leaked into ListBuckets"
 
-    dir_listed = {b["Name"] for b in s3.list_directory_buckets().get("Buckets", [])}
+    dir_listed = {b["Name"] for b in _s3_control(ctx).list_directory_buckets().get("Buckets", [])}
     assert dir_bucket in dir_listed, f"expected {dir_bucket} in ListDirectoryBuckets output"
     assert gp_bucket not in dir_listed, f"general-purpose bucket {gp_bucket} leaked into ListDirectoryBuckets"
 
@@ -34,7 +40,7 @@ def _create_bucket(s3, ctx, bucket: str) -> None:
     # us-east-1 is S3's original region: CreateBucket rejects an explicit LocationConstraint there.
     if ctx.region and ctx.region != "us-east-1":
         kwargs["CreateBucketConfiguration"] = {"LocationConstraint": ctx.region}
-    s3.create_bucket(**kwargs)
+    _s3_control(ctx).create_bucket(**kwargs)
 
 
 def _safe(fn, *args, **kwargs):
@@ -63,7 +69,7 @@ def _create_directory_bucket(ctx):
     for az_id in az_ids:
         bucket = f"{base}--{az_id}--x-s3"
         try:
-            s3.create_bucket(
+            _s3_control(ctx).create_bucket(
                 Bucket=bucket,
                 CreateBucketConfiguration={
                     "Location": {"Type": "AvailabilityZone", "Name": az_id},

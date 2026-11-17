@@ -121,7 +121,8 @@ def lambda_handler(event, context):
     )
     role = iam.create_role(RoleName=role_name, AssumeRolePolicyDocument=trust)
     role_arn = role["Role"]["Arn"]
-    ctx.on_cleanup(lambda: ctx.client("iam").delete_role(RoleName=role_name))
+    # the role holds an inline policy, which must go before the role
+    ctx.on_cleanup(lambda: _delete_role(ctx, role_name))
 
     policy_doc = json.dumps(
         {
@@ -330,11 +331,9 @@ def _create_function_with_retry(
             ctx.on_cleanup(lambda: lam.delete_function(FunctionName=name))
             # The function auto-creates /aws/lambda/<name> on first invoke; that log group survives
             # function deletion, so delete it
-            # too (best-effort — on_cleanup swallows if it was never created).
+            # too (it exists only once the function has logged, so not-found is fine).
             ctx.on_cleanup(
-                lambda: ctx.client("logs").delete_log_group(
-                    logGroupName=f"/aws/lambda/{name}"
-                )
+                lambda: _delete_function_log_group(ctx, f"/aws/lambda/{name}")
             )
             _wait_function_active(ctx, name)
             return {"name": name, "arn": resp["FunctionArn"]}
@@ -446,6 +445,15 @@ def _wire_event_source(
         description=f"ESM {esm_uuid} Enabled",
     )
     return esm_uuid
+
+
+def _delete_function_log_group(ctx, name: str) -> None:
+    """Delete a function's log group, which exists only once the function has written a log line."""
+    logs = ctx.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=name)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
 
 
 if __name__ == "__main__":

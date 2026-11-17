@@ -140,7 +140,7 @@ def _create_forwarder_function(ctx, role_arn: str, queue_url: str) -> dict[str, 
     fn_arn = resp["FunctionArn"]
     ctx.on_cleanup(lambda: lam.delete_function(FunctionName=fn_name))
     ctx.on_cleanup(
-        lambda: ctx.client("logs").delete_log_group(logGroupName=f"/aws/lambda/{fn_name}")
+        lambda: _delete_function_log_group(ctx, f"/aws/lambda/{fn_name}")
     )
     _poll_until(
         lambda: lam.get_function(FunctionName=fn_name)["Configuration"]["State"],
@@ -255,6 +255,14 @@ def _publish_until_delivered(
             time.sleep(1.5)
     return []
 
+
+def _delete_function_log_group(ctx, name: str) -> None:
+    """Delete a function's log group, which exists only once the function has written a log line."""
+    logs = ctx.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=name)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
 
 
 if __name__ == "__main__":

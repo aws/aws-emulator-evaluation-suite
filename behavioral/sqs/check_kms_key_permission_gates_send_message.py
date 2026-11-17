@@ -14,6 +14,21 @@ GROUP = "overly-permissive"
 SERVICES = ["sqs"]
 
 
+def _delete_queue_until_gone(sqs, url, timeout_s=40.0):
+    sqs.delete_queue(QueueUrl=url)
+    # SQS deletes the queue in the background, still using its key until it is gone.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "AWS.SimpleQueueService.NonExistentQueue":
+                return
+            raise
+        time.sleep(2)
+    raise AssertionError(f"queue {url} still exists {timeout_s}s after its delete")
+
+
 @tags("axis:rejection", "cap:c2", "cap:c7", "concern:data-plane", "concern:negative-classes", "dp:api", "plane:data")
 def run(ctx) -> None:
     """SendMessage on an SSE-KMS queue whose key policy denies GenerateDataKey fails with
@@ -51,7 +66,7 @@ def run(ctx) -> None:
     denied_url = sqs.create_queue(
         QueueName=ctx.unique_name("sim2real-behav-denied-"), Attributes={"KmsMasterKeyId": key_id}
     )["QueueUrl"]
-    ctx.on_cleanup(lambda: sqs.delete_queue(QueueUrl=denied_url))
+    ctx.on_cleanup(lambda: _delete_queue_until_gone(sqs, denied_url))
     sqs.tag_queue(QueueUrl=denied_url, Tags={"sim2real": key_tag})
 
     def _attempt():

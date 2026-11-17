@@ -30,6 +30,21 @@ def _reuse(sqs, url) -> str:
     ]["KmsDataKeyReusePeriodSeconds"]
 
 
+def _delete_queue_until_gone(sqs, url, timeout_s=40.0):
+    sqs.delete_queue(QueueUrl=url)
+    # SQS deletes the queue in the background, still using its key until it is gone.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "AWS.SimpleQueueService.NonExistentQueue":
+                return
+            raise
+        time.sleep(2)
+    raise AssertionError(f"queue {url} still exists {timeout_s}s after its delete")
+
+
 @tags("axis:rejection", "cap:c1", "concern:data-plane", "concern:negative-classes", "dp:api", "plane:control", "plane:data")
 def run(ctx) -> None:
     """KmsDataKeyReusePeriodSeconds on an SSE-KMS queue accepts only 60..86400 (default 300): 59,
@@ -44,7 +59,7 @@ def run(ctx) -> None:
     ctx.on_cleanup(lambda: kms.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7))
 
     url = sqs.create_queue(QueueName=name, Attributes={"KmsMasterKeyId": key_id})["QueueUrl"]
-    ctx.on_cleanup(lambda: sqs.delete_queue(QueueUrl=url))
+    ctx.on_cleanup(lambda: _delete_queue_until_gone(sqs, url))
     assert _reuse(sqs, url) == "300", f"default KmsDataKeyReusePeriodSeconds was {_reuse(sqs, url)!r}"
 
     refused_name = name + "-refused"

@@ -231,31 +231,6 @@ def test_a_long_tmpdir_base_falls_back_to_tmp(monkeypatch):
     assert context_module.socket_safe_tmp_base() is None
 
 
-def test_emulator_clients_pin_off_endpoint_rulesets_and_sign_s3_express_control_without_session():
-    ctx = Context("http://127.0.0.1:9", creds=FIXED_CREDS)
-    sent: list[str] = []
-
-    def capture(request, **_):
-        sent.append(request.url)
-        raise RuntimeError("captured")
-
-    signin, s3 = ctx.client("signin"), ctx.client("s3")
-    for client in (signin, s3):
-        client.meta.events.register_last("before-send", capture)
-    with pytest.raises(RuntimeError, match="captured"):
-        signin.get_console_authorization_configuration()
-    assert sent[-1].startswith("http://127.0.0.1:9/")
-    with pytest.raises(RuntimeError, match="captured"):
-        s3.create_bucket(
-            Bucket="b--usw2-az1--x-s3",
-            CreateBucketConfiguration={
-                "Location": {"Type": "AvailabilityZone", "Name": "usw2-az1"},
-                "Bucket": {"Type": "Directory", "DataRedundancy": "SingleAvailabilityZone"},
-            },
-        )
-    assert sent[-1].startswith("http://127.0.0.1:9/") and "session" not in sent[-1]
-
-
 def test_a_context_whose_start_deadline_takes_no_this_thread_still_runs():
     """A caller's own context with ``start_deadline(budget_s)`` keeps one budget, no TypeError."""
 

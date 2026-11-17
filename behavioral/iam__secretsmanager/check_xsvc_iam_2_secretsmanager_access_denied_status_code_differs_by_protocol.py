@@ -1,6 +1,7 @@
 """xsvc-iam-2-secretsmanager-access-denied-status-code-differs-by-protocol."""
 from __future__ import annotations
 
+import re
 import time
 
 from botocore.exceptions import ClientError
@@ -10,6 +11,22 @@ from behavioral_harness import tags
 CHECK = "xsvc-iam-2-secretsmanager-access-denied-status-code-differs-by-protocol"
 GROUP = "auth_enforcement"
 SERVICES = ["iam", "secretsmanager"]
+
+
+# IAM ends a denial with a pointer to a per-request authorization id, given twice (in a console URL
+# and on its own); every other character is graded.
+_AUTHZ_TAIL = (
+    r"\. Go to https://[a-z0-9-]+\.console\.aws\.amazon\.com/iam/home\?region=[a-z0-9-]+"
+    r"#/authorization-details/(\w+) for complete details, or call the "
+    r"GetRequestAuthorizationDetails API with the following authorization id: \1"
+)
+
+
+def _expected_denial(message, head):
+    """``head`` followed by the authorization-details pointer that ends ``message``: the pointer's
+    region and per-request authorization id are the only parts read back from it."""
+    found = re.search(_AUTHZ_TAIL + r"\Z", message or "")
+    return head + (found.group(0) if found else ". Go to <authorization-details pointer>")
 
 
 def _error_code_and_status(fn):
@@ -90,9 +107,10 @@ def run(ctx) -> None:
         f"'AccessDenied', got {iam_code!r}"
     )
     user_arn = f"arn:aws:iam::{ctx.account}:user/{user_name}"
-    want = (f"User: {user_arn} is not authorized to perform: iam:ListUsers on resource: "
-            f"arn:aws:iam::{ctx.account}:user/ because no identity-based policy allows the "
-            f"iam:ListUsers action")
+    want = _expected_denial(iam_msg, (
+        f"User: {user_arn} is not authorized to perform: iam:ListUsers on resource: "
+        f"arn:aws:iam::{ctx.account}:user/ because no identity-based policy allows the "
+        f"iam:ListUsers action"))
     assert iam_msg == want, f"IAM denial message: expected {want!r}, got {iam_msg!r}"
     assert iam_status == 403, (
         f"expected IAM's awsQuery AccessDenied to carry HTTP 403, got {iam_status!r}"

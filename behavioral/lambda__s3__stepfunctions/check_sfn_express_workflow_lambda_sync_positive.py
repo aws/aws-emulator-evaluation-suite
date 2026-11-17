@@ -366,11 +366,9 @@ def _create_function_with_retry(
             ctx.on_cleanup(lambda: lam.delete_function(FunctionName=name))
             # The function auto-creates /aws/lambda/<name> on first invoke; that log group survives
             # function deletion and sweep_account doesn't scan log groups, so it would leak. Delete it
-            # too (best-effort — on_cleanup swallows if it was never created).
+            # too (it exists only once the function has logged, so not-found is fine).
             ctx.on_cleanup(
-                lambda: ctx.client("logs").delete_log_group(
-                    logGroupName=f"/aws/lambda/{name}"
-                )
+                lambda: _delete_function_log_group(ctx, f"/aws/lambda/{name}")
             )
             _wait_function_active(ctx, name)
             return {"name": name, "arn": resp["FunctionArn"]}
@@ -472,6 +470,15 @@ def _empty_and_delete_bucket(ctx, bucket: str) -> None:
             if exc.response["Error"]["Code"] != "NoSuchBucket":
                 raise
     s3.delete_bucket(Bucket=bucket)
+
+
+def _delete_function_log_group(ctx, name: str) -> None:
+    """Delete a function's log group, which exists only once the function has written a log line."""
+    logs = ctx.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=name)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
 
 
 if __name__ == "__main__":

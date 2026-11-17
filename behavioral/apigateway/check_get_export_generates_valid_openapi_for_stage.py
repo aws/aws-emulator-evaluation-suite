@@ -92,7 +92,10 @@ def _deploy_minimal_api(ctx, path_part: str, stage_name: str = "teststage"):
 
 def _add_second_stage(ctx, apigw, api_id: str, path_part: str, stage_name: str = "teststage2") -> str:
     """Add a POST resource to the same API, deploy it, and pin a second stage to that deployment."""
-    root_id = apigw.get_resources(restApiId=api_id)["items"][0]["id"]
+    # The API already holds another resource, and GetResources lists items in no stated order.
+    items = apigw.get_resources(restApiId=api_id)["items"]
+    root_id = next((r["id"] for r in items if r["path"] == "/"), None)
+    assert root_id, f"GetResources holds no '/' resource: {[r.get('path') for r in items]!r}"
     resource_id = apigw.create_resource(restApiId=api_id, parentId=root_id, pathPart=path_part)["id"]
 
     apigw.put_method(restApiId=api_id, resourceId=resource_id, httpMethod="POST", authorizationType="NONE")

@@ -69,7 +69,7 @@ def run(ctx) -> None:
 
     # The query-result association is one per account per region; this restores the account
     # default. Registered before the two calls expected to be rejected, in case one is accepted.
-    ctx.on_cleanup(lambda: logs.disassociate_kms_key(resourceIdentifier=query_result_arn))
+    ctx.on_cleanup(lambda: _disassociate_query_results_and_wait(logs, query_result_arn, query))
 
     # Both selectors at once is a request-shape violation.
     both, both_msg = _error(lambda: logs.associate_kms_key(
@@ -176,6 +176,19 @@ def _run_query(logs, client_error, group: str, start_ms: int, marker: str):
         return ("status", resp["status"], qid)
     rows = [[f["value"] for f in row if f["field"] == "@message"] for row in resp["results"]]
     return ("ok", [r[0] for r in rows if r], resp.get("encryptionKey"))
+
+
+def _disassociate_query_results_and_wait(logs, query_result_arn: str, query,
+                                         timeout_s: float = 45.0) -> None:
+    logs.disassociate_kms_key(resourceIdentifier=query_result_arn)
+    # Wait until queries no longer use the key: the key's teardown runs next.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        result = query()
+        if result[0] == "ok" and result[2] is None:
+            return
+        time.sleep(3)
+    raise AssertionError(f"query results still encrypted with a CMK after {timeout_s}s")
 
 
 def _error(fn, client_error) -> tuple[str, str]:

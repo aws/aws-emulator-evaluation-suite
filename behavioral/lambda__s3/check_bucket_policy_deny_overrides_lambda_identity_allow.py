@@ -188,7 +188,7 @@ def _create_function_with_retry(ctx, handler_code, role_arn, env=None, timeout=3
             resp = lam.create_function(**kwargs)
             ctx.on_cleanup(lambda: ctx.client("lambda").delete_function(FunctionName=name))
             ctx.on_cleanup(
-                lambda: ctx.client("logs").delete_log_group(logGroupName=f"/aws/lambda/{name}")
+                lambda: _delete_function_log_group(ctx, f"/aws/lambda/{name}")
             )
             _wait_function_active(ctx, name)
             return {"name": name, "arn": resp["FunctionArn"]}
@@ -420,6 +420,15 @@ def run(ctx) -> None:
     assert restored["denied"]["body"] == secret.decode(), (
         f"removing the Deny statement must restore access via the identity policy alone: {restored!r}"
     )
+
+
+def _delete_function_log_group(ctx, name: str) -> None:
+    """Delete a function's log group, which exists only once the function has written a log line."""
+    logs = ctx.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=name)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import time
 
 from behavioral_harness import tags
@@ -67,8 +68,7 @@ def run(ctx) -> None:
 
     acct = ctx.account
     denied = {
-        # > tomorrow. message varies: this denial ends with a per-request authorization id, so
-        # the code and the named action are graded.
+        # > tomorrow: the code and the named action are graded.
         "iam:ListAccountAliases": (lambda: me.list_account_aliases(), None),
         # < yesterday
         "iam:ListRoles": (lambda: me.list_roles(MaxItems=1), f"arn:aws:iam::{acct}:role/"),
@@ -118,6 +118,22 @@ def _denied_code(fn):
     return "<allowed>", ""
 
 
+# IAM ends a denial with a pointer to a per-request authorization id, given twice (in a console URL
+# and on its own); every other character is graded.
+_AUTHZ_TAIL = (
+    r"\. Go to https://[a-z0-9-]+\.console\.aws\.amazon\.com/iam/home\?region=[a-z0-9-]+"
+    r"#/authorization-details/(\w+) for complete details, or call the "
+    r"GetRequestAuthorizationDetails API with the following authorization id: \1"
+)
+
+
+def _expected_denial(message, head):
+    """``head`` followed by the authorization-details pointer that ends ``message``: the pointer's
+    region and per-request authorization id are the only parts read back from it."""
+    found = re.search(_AUTHZ_TAIL + r"\Z", message or "")
+    return head + (found.group(0) if found else ". Go to <authorization-details pointer>")
+
+
 def _assert_stably_denied(fn, action, expected, rounds=3):
     for i in range(rounds):
         code, msg = _denied_code(fn)
@@ -125,9 +141,10 @@ def _assert_stably_denied(fn, action, expected, rounds=3):
             f"{action}: expected AccessDenied (round {i + 1}/{rounds}), got {code!r} {msg!r}"
         )
         if expected is not None:
-            assert msg == expected, f"{action}: expected message {expected!r}, got {msg!r}"
+            want = _expected_denial(msg, expected)
+            assert msg == want, f"{action}: expected message {want!r}, got {msg!r}"
         else:
-            # message varies: per-request authorization id; the named action is its stable part
+            # the named action is graded
             assert f"perform: {action}" in msg, f"{action}: denial message names another action: {msg!r}"
         time.sleep(2)
 

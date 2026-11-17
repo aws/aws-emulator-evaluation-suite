@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from botocore.exceptions import ClientError
+from botocore.config import Config
 from behavioral_harness import tags
 
 
@@ -22,6 +23,11 @@ _S3EXPRESS_AZ_BY_REGION = {
 }
 
 
+def _s3_control(ctx):
+    """S3 for a directory bucket's control calls, which AWS serves without an S3 Express session."""
+    return ctx.client("s3", config=Config(s3={"disable_s3_express_session_auth": True}))
+
+
 def _err(fn):
     """Call fn(); return the ClientError (Code, Message); raise if the call succeeds."""
     try:
@@ -40,7 +46,7 @@ def _create_directory_bucket(ctx, s3, base):
     for az in azs:
         bucket = f"{base}--{az}--x-s3"
         try:
-            s3.create_bucket(
+            _s3_control(ctx).create_bucket(
                 Bucket=bucket,
                 CreateBucketConfiguration={
                     "Location": {"Type": "AvailabilityZone", "Name": az},
@@ -81,7 +87,7 @@ def run(ctx) -> None:
     # resolution cannot build a resolvable hostname and the request never reaches the service.
     missing = f"{base}-missing--{az}--x-s3"
 
-    listed_before = [b["Name"] for b in s3.list_directory_buckets().get("Buckets", [])]
+    listed_before = [b["Name"] for b in _s3_control(ctx).list_directory_buckets().get("Buckets", [])]
     assert missing not in listed_before, f"bucket {missing} unexpectedly already present in {listed_before}"
 
     err = _err(lambda: s3.create_session(Bucket=missing))
@@ -90,7 +96,7 @@ def run(ctx) -> None:
     )
 
     # Effect absent: an independent read confirms the bucket does not exist.
-    listed_after = [b["Name"] for b in s3.list_directory_buckets().get("Buckets", [])]
+    listed_after = [b["Name"] for b in _s3_control(ctx).list_directory_buckets().get("Buckets", [])]
     assert missing not in listed_after, f"bucket {missing} unexpectedly present in {listed_after}"
 
 

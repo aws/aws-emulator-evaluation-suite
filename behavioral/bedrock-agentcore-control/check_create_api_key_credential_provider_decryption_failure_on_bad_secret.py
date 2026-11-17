@@ -39,7 +39,7 @@ def run(ctx) -> None:
         Tags=_SM_TAGS,
     )
     secret_arn = secret["ARN"]
-    ctx.on_cleanup(lambda: secretsmanager.delete_secret(SecretId=secret_arn, ForceDeleteWithoutRecovery=True))
+    ctx.on_cleanup(lambda: _delete_secret(secretsmanager, secret_arn))
 
     kms.disable_key(KeyId=key_id)
 
@@ -116,6 +116,19 @@ def _poll_until_success(fn, *, timeout_s: float, description: str):
                     f"waited {timeout_s}s for {description}; last error was {last_code!r}"
                 ) from err
             time.sleep(3.0)
+
+
+def _delete_secret(secretsmanager, secret_arn: str, timeout_s: float = 25.0) -> None:
+    """Force-delete a secret and wait until it reads as gone, so its KMS key is retired after it."""
+    secretsmanager.delete_secret(SecretId=secret_arn, ForceDeleteWithoutRecovery=True)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:  # the secret deletes in the background
+        try:
+            secretsmanager.describe_secret(SecretId=secret_arn)
+        except secretsmanager.exceptions.ResourceNotFoundException:
+            return
+        time.sleep(2.0)
+    raise AssertionError(f"secret {secret_arn} still present {timeout_s}s after its delete")
 
 
 def _best_effort_delete(control, name: str) -> None:

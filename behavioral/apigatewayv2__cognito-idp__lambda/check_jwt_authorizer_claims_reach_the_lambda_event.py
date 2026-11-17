@@ -504,7 +504,7 @@ def _create_lambda(ctx, handler_code, env=None, permissions=None, timeout=30):
     )
     ctx.on_cleanup(lambda: ctx.client("lambda").delete_function(FunctionName=name))
     ctx.on_cleanup(
-        lambda: ctx.client("logs").delete_log_group(logGroupName=f"/aws/lambda/{name}")
+        lambda: _delete_function_log_group(ctx, f"/aws/lambda/{name}")
     )
     _poll_until(
         ctx,
@@ -529,6 +529,15 @@ def _allow_apigw_invoke(ctx, fn_name, source_arn, statement_id="apigw-invoke"):
     except ClientError as exc:
         if exc.response.get("Error", {}).get("Code") != "ResourceConflictException":
             raise
+
+
+def _delete_function_log_group(ctx, name: str) -> None:
+    """Delete a function's log group, which exists only once the function has written a log line."""
+    logs = ctx.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=name)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
 
 
 if __name__ == "__main__":

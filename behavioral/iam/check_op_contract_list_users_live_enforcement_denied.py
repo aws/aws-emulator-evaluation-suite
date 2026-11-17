@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 
 from botocore.exceptions import ClientError
@@ -12,6 +13,22 @@ SERVICES = ["iam"]
 
 
 from behavioral_harness import tags
+
+
+# IAM ends a denial with a pointer to a per-request authorization id, given twice (in a console URL
+# and on its own); every other character is graded.
+_AUTHZ_TAIL = (
+    r"\. Go to https://[a-z0-9-]+\.console\.aws\.amazon\.com/iam/home\?region=[a-z0-9-]+"
+    r"#/authorization-details/(\w+) for complete details, or call the "
+    r"GetRequestAuthorizationDetails API with the following authorization id: \1"
+)
+
+
+def _expected_denial(message, head):
+    """``head`` followed by the authorization-details pointer that ends ``message``: the pointer's
+    region and per-request authorization id are the only parts read back from it."""
+    found = re.search(_AUTHZ_TAIL + r"\Z", message or "")
+    return head + (found.group(0) if found else ". Go to <authorization-details pointer>")
 
 
 @tags("axis:rejection", "cap:c7", "concern:negative-classes", "concern:representation", "plane:control")
@@ -59,10 +76,10 @@ def run(ctx) -> None:
     )
     assert denied_code == "AccessDenied", f"expected AccessDenied, got {denied_code!r}"
     account_id = arn.split(":")[4]
-    expected = (
+    expected = _expected_denial(denied_message, (
         f"User: {session_arn} is not authorized to perform: iam:ListUsers on resource: "
         f"arn:aws:iam::{account_id}:user{path} with an explicit deny in an identity-based policy"
-    )
+    ))
     assert denied_message == expected, f"expected message {expected!r}, got {denied_message!r}"
 
     # positive control: the original principal's access is unaffected by a Deny scoped to the

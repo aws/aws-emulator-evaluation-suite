@@ -160,7 +160,7 @@ def _create_function(ctx, role_arn: str) -> tuple[str, str]:
     # The function auto-creates /aws/lambda/<name> on first invoke; that log group survives
     # function deletion, so delete it.
     ctx.on_cleanup(
-        lambda: ctx.client("logs").delete_log_group(logGroupName=f"/aws/lambda/{fn_name}")
+        lambda: _delete_function_log_group(ctx, f"/aws/lambda/{fn_name}")
     )
     lam.get_waiter("function_active_v2").wait(FunctionName=fn_name, WaiterConfig={"Delay": 2, "MaxAttempts": 150})
     return fn_name, resp["FunctionArn"]
@@ -175,6 +175,15 @@ def _poll_for_message(ctx, queue_url: str, timeout_s: float) -> str:
             sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
             return msg["Body"]
     raise AssertionError(f"no failure-destination event delivered within {timeout_s}s")
+
+
+def _delete_function_log_group(ctx, name: str) -> None:
+    """Delete a function's log group, which exists only once the function has written a log line."""
+    logs = ctx.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=name)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
 
 
 if __name__ == "__main__":

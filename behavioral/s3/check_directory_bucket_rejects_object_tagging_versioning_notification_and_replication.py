@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from botocore.exceptions import ClientError
 
+from botocore.config import Config
 from behavioral_harness import tags
 
 CHECK = "directory-bucket-rejects-object-tagging-versioning-notification-and-replication"
@@ -21,6 +22,11 @@ _S3EXPRESS_AZ_IDS = {
     "eu-west-1": ["euw1-az1", "euw1-az3"],
     "eu-north-1": ["eun1-az1", "eun1-az2", "eun1-az3"],
 }
+
+
+def _s3_control(ctx):
+    """S3 for a directory bucket's control calls, which AWS serves without an S3 Express session."""
+    return ctx.client("s3", config=Config(s3={"disable_s3_express_session_auth": True}))
 
 
 def _empty_and_delete_directory_bucket(s3, bucket):
@@ -48,7 +54,7 @@ def _directory_bucket(ctx, s3, prefix):
     for az in azs:
         name = f"{base}--{az}--x-s3"
         try:
-            s3.create_bucket(
+            _s3_control(ctx).create_bucket(
                 Bucket=name,
                 CreateBucketConfiguration={
                     "Location": {"Type": "AvailabilityZone", "Name": az},
@@ -68,9 +74,9 @@ def _general_purpose_bucket(ctx, s3, prefix):
     params = {"Bucket": name}
     if ctx.region != "us-east-1":
         params["CreateBucketConfiguration"] = {"LocationConstraint": ctx.region}
-    s3.create_bucket(**params)
+    _s3_control(ctx).create_bucket(**params)
     ctx.on_cleanup(lambda: _empty_and_delete_versioned_bucket(s3, name))
-    s3.put_bucket_tagging(Bucket=name, Tagging={"TagSet": [{"Key": "sim2real", "Value": CHECK}]})
+    _s3_control(ctx).put_bucket_tagging(Bucket=name, Tagging={"TagSet": [{"Key": "sim2real", "Value": CHECK}]})
     return name
 
 
@@ -105,29 +111,29 @@ def run(ctx) -> None:
     twin_tags = sorted((t["Key"], t["Value"]) for t in s3.get_object_tagging(Bucket=twin, Key="a.txt")["TagSet"])
     assert twin_tags == [("k", "v")], f"the general-purpose twin's tag did not land: {twin_tags!r}"
 
-    code, message = _error(lambda: s3.put_bucket_versioning(
+    code, message = _error(lambda: _s3_control(ctx).put_bucket_versioning(
         Bucket=directory, VersioningConfiguration={"Status": "Enabled"}))
     assert (code, message) == (
         "InvalidArgument", "VersioningConfiguration is not valid, expected CreateBucketConfiguration"
     ), f"PutBucketVersioning on a directory bucket returned {(code, message)!r}"
-    s3.put_bucket_versioning(Bucket=twin, VersioningConfiguration={"Status": "Enabled"})
-    assert s3.get_bucket_versioning(Bucket=twin).get("Status") == "Enabled", (
+    _s3_control(ctx).put_bucket_versioning(Bucket=twin, VersioningConfiguration={"Status": "Enabled"})
+    assert _s3_control(ctx).get_bucket_versioning(Bucket=twin).get("Status") == "Enabled", (
         "the general-purpose twin's PutBucketVersioning did not take effect"
     )
 
-    code, message = _error(lambda: s3.put_bucket_notification_configuration(
+    code, message = _error(lambda: _s3_control(ctx).put_bucket_notification_configuration(
         Bucket=directory, NotificationConfiguration={}))
     assert (code, message) == (
         "InvalidArgument", "NotificationConfiguration is not valid, expected CreateBucketConfiguration"
     ), f"PutBucketNotificationConfiguration on a directory bucket returned {(code, message)!r}"
-    s3.put_bucket_notification_configuration(Bucket=twin, NotificationConfiguration={})
-    twin_notification = s3.get_bucket_notification_configuration(Bucket=twin)
+    _s3_control(ctx).put_bucket_notification_configuration(Bucket=twin, NotificationConfiguration={})
+    twin_notification = _s3_control(ctx).get_bucket_notification_configuration(Bucket=twin)
     configured = sorted(k for k in twin_notification if k.endswith("Configurations"))
     assert configured == [], (
         f"the general-purpose twin's empty notification configuration read back {configured!r}"
     )
 
-    code, message = _error(lambda: s3.put_bucket_replication(
+    code, message = _error(lambda: _s3_control(ctx).put_bucket_replication(
         Bucket=directory,
         ReplicationConfiguration={
             "Role": f"arn:aws:iam::{ctx.account}:role/sim2real-does-not-need-to-exist",

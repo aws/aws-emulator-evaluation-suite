@@ -40,6 +40,18 @@ def _wait_sse_settled(ddb, table, deadline_s=240):
     raise AssertionError(f'{table} never settled within {deadline_s}s')
 
 
+def _delete_table_until_gone(ddb, table):
+    """Delete the table if it still exists, then wait until DynamoDB reports it gone."""
+    try:
+        ddb.delete_table(TableName=table)
+    except ClientError as exc:
+        if exc.response['Error']['Code'] == 'ResourceNotFoundException':
+            return
+        raise
+    # DynamoDB deletes the table in the background, still using its key until it is gone.
+    ddb.get_waiter('table_not_exists').wait(TableName=table, WaiterConfig={'Delay': 2, 'MaxAttempts': 100})
+
+
 @tags("axis:rejection", "cap:c1", "concern:negative-classes", "concern:representation", "plane:control")
 def run(ctx) -> None:
     """UpdateTable SSESpecification naming a nonexistent CMK ARN is rejected and leaves the
@@ -51,7 +63,7 @@ def run(ctx) -> None:
     kms = ctx.client('kms')
 
     table = ctx.unique_name('sim2real-behav-ddb-sse-bad-cmk-')
-    ctx.on_cleanup(lambda: ddb.delete_table(TableName=table))
+    ctx.on_cleanup(lambda: _delete_table_until_gone(ddb, table))
     ddb.create_table(
         TableName=table,
         KeySchema=[{'AttributeName': 'pk', 'KeyType': 'HASH'}],
@@ -98,6 +110,7 @@ def run(ctx) -> None:
         Description=f'{table} control key', Tags=[{'TagKey': 'sim2real', 'TagValue': CHECK}],
     )['KeyMetadata']
     ctx.on_cleanup(lambda: kms.schedule_key_deletion(KeyId=key['KeyId'], PendingWindowInDays=7))
+    ctx.on_cleanup(lambda: _delete_table_until_gone(ddb, table))
     ddb.update_table(
         TableName=table,
         SSESpecification={'Enabled': True, 'SSEType': 'KMS', 'KMSMasterKeyId': key['KeyId']},

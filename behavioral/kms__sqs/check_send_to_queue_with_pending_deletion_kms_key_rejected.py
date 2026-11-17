@@ -99,6 +99,21 @@ def _pending_message(key_arn: str, message: str) -> str:
     )
 
 
+def _delete_queue_until_gone(sqs, url, timeout_s=40.0):
+    sqs.delete_queue(QueueUrl=url)
+    # SQS deletes the queue in the background, still using its key until it is gone.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "AWS.SimpleQueueService.NonExistentQueue":
+                return
+            raise
+        time.sleep(2)
+    raise AssertionError(f"queue {url} still exists {timeout_s}s after its delete")
+
+
 @tags("axis:rejection", "cap:c1", "concern:data-plane", "concern:e2e",
       "concern:negative-classes", "dp:api", "plane:data")
 def run(ctx) -> None:
@@ -126,7 +141,7 @@ def run(ctx) -> None:
         Attributes={"KmsMasterKeyId": key_arn},
         tags=_QUEUE_TAGS,
     )["QueueUrl"]
-    ctx.on_cleanup(_teardown(lambda: sqs.delete_queue(QueueUrl=control_url),
+    ctx.on_cleanup(_teardown(lambda: _delete_queue_until_gone(sqs, control_url),
                              "AWS.SimpleQueueService.NonExistentQueue"))
 
     # --- positive control: the key encrypts for SQS before anything is broken -----------
@@ -149,7 +164,7 @@ def run(ctx) -> None:
         Attributes={"KmsMasterKeyId": key_arn},
         tags=_QUEUE_TAGS,
     )["QueueUrl"]
-    ctx.on_cleanup(_teardown(lambda: sqs.delete_queue(QueueUrl=url),
+    ctx.on_cleanup(_teardown(lambda: _delete_queue_until_gone(sqs, url),
                              "AWS.SimpleQueueService.NonExistentQueue"))
     attrs = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["KmsMasterKeyId"])["Attributes"]
     assert attrs.get("KmsMasterKeyId") == key_arn, (

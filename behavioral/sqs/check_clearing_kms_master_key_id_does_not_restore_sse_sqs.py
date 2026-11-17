@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import time
 
+from botocore.exceptions import ClientError
+
 from behavioral_harness import tags
 
 CHECK = "clearing-kms-master-key-id-does-not-restore-sse-sqs"
@@ -28,6 +30,21 @@ def _poll(probe, predicate, *, timeout_s=60.0, interval_s=2.0):
     return last
 
 
+def _delete_queue_until_gone(sqs, url, timeout_s=40.0):
+    sqs.delete_queue(QueueUrl=url)
+    # SQS deletes the queue in the background, still using its key until it is gone.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "AWS.SimpleQueueService.NonExistentQueue":
+                return
+            raise
+        time.sleep(2)
+    raise AssertionError(f"queue {url} still exists {timeout_s}s after its delete")
+
+
 @tags("axis:happy-path", "cap:c1", "concern:data-plane", "concern:representation", "dp:api", "plane:data")
 def run(ctx) -> None:
     """Clearing an SSE-KMS queue's KMS key id drops both KMS attributes but leaves
@@ -45,7 +62,7 @@ def run(ctx) -> None:
     url = sqs.create_queue(
         QueueName=name, Attributes={"KmsMasterKeyId": key_id}, tags={"sim2real": CHECK}
     )["QueueUrl"]
-    ctx.on_cleanup(lambda: sqs.delete_queue(QueueUrl=url))
+    ctx.on_cleanup(lambda: _delete_queue_until_gone(sqs, url))
 
     before = _sse(sqs, url)
     assert before.get("KmsMasterKeyId") == key_id, f"queue did not pick up the KMS key: {before!r}"

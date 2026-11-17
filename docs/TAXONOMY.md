@@ -6,8 +6,8 @@ Each row of `manifest.jsonl` carries labels from these namespaces.
 
 Which plane the operation the assertion is about belongs to; a rejection belongs to the plane of the rejected call. A test carries both values when it asserts on both, such as a refused configuration and its effect on data.
 
-- `plane:control`: The assertion is about configuring AWS resources: creating, updating, deleting, or describing them, or evaluating a policy without using a resource (ValidatePolicy, SimulatePrincipalPolicy, an access preview). A rejected configuration call, such as a malformed PutBucketPolicy, is control.
-- `plane:data`: The assertion is about using AWS resources: data being written, stored, or read back; messages sent; or functions invoked. A rejected or denied use, such as a GetObject denied by a bucket policy or a Decrypt without a grant, is data. Requires one or more `dp` values naming the data planes.
+- `plane:control`: The assertion is about configuring AWS resources: creating, updating, deleting, or describing them (an S3 object's ACL, tags, retention or legal hold included), or evaluating a policy without using a resource (ValidatePolicy, SimulatePrincipalPolicy, an access preview). A rejected configuration call, such as a malformed PutBucketPolicy, is control.
+- `plane:data`: The assertion is about using AWS resources: data being written, stored, or read back; messages sent; functions invoked or workloads started (RunTask, SubmitJob, StartPipelineExecution); or a delivery observed through a describe (DescribeLogStreams, LookupEvents, DescribeAlarmHistory). A rejected or denied use, such as a GetObject denied by a bucket policy or a Decrypt without a grant, is data. Requires one or more `dp` values naming the data planes.
 
 ## `dp`
 

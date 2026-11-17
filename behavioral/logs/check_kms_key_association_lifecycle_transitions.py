@@ -98,6 +98,7 @@ def run(ctx) -> None:
         timeout_s=60,
         interval_s=3,
     )
+    ctx.on_cleanup(lambda: _disassociate_and_wait(logs, log_group_name))
     associated = _poll_until(
         lambda: current_kms_key_id(), lambda v: v == key_arn, timeout_s=60, interval_s=2
     )
@@ -155,6 +156,18 @@ def _poll_until(probe, predicate, *, timeout_s=60.0, interval_s=2.0):
     raise AssertionError(
         f"condition not met within {timeout_s}s (last value: {last!r})"
     )
+
+
+def _disassociate_and_wait(logs, group: str, timeout_s: float = 30.0) -> None:
+    logs.disassociate_kms_key(logGroupName=group)
+    # Wait until the group no longer uses the key: the key's teardown runs next.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        found = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"]
+        if not any(g["logGroupName"] == group and "kmsKeyId" in g for g in found):
+            return
+        time.sleep(2)
+    raise AssertionError(f"log group {group} still has a KMS key after {timeout_s}s")
 
 
 if __name__ == "__main__":

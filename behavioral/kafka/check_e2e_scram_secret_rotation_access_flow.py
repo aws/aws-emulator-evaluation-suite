@@ -25,6 +25,8 @@ def run(ctx) -> None:
     assert kafka.list_scram_secrets(ClusterArn=cluster_arn)["SecretArnList"] == []
 
     good_secret = _create_scram_secret(ctx, ctx.unique_name("sim2real-behav-kafka-scram-good-"))
+    # Registered after the secret's key, so the cluster is gone before the key is retired.
+    ctx.on_cleanup(lambda: _delete_cluster(ctx, kafka, cluster_arn))
     resp = kafka.batch_associate_scram_secret(ClusterArn=cluster_arn, SecretArnList=[good_secret])
     assert resp["UnprocessedScramSecrets"] == []
     assert kafka.list_scram_secrets(ClusterArn=cluster_arn)["SecretArnList"] == [good_secret]
@@ -83,22 +85,43 @@ def _create_scram_cluster(ctx, kafka, subnets, sg, version):
         Tags={"sim2real:managed": "true"},
     )
     arn = resp["ClusterArn"]
+    # Deletes the cluster if the check fails before run() registers its key-ordered delete; once that
+    # one has run, this one reads the cluster as not found.
     ctx.on_cleanup(lambda: _delete_cluster(ctx, kafka, arn))
     return arn
 
 
-def _delete_cluster(ctx, kafka, arn):
+def _delete_cluster(ctx, kafka, arn, timeout_s=900.0):
     from botocore.exceptions import ClientError
 
+    # Waits out CREATING within the suite's teardown budget, leaving room for the delete's own wait; a
+    # cluster still CREATING after that fails the teardown, and the account is released DIRTY.
+    deadline = time.monotonic() + 2700.0
+    while time.monotonic() < deadline:  # a CREATING cluster refuses DeleteCluster
+        try:
+            state = kafka.describe_cluster_v2(ClusterArn=arn)["ClusterInfo"]["State"]
+        except kafka.exceptions.NotFoundException:
+            return
+        if state != "CREATING":
+            break
+        time.sleep(15.0)
     try:
         kafka.delete_cluster(ClusterArn=arn)
     except ClientError as e:
         if e.response["Error"]["Code"] == "NotFoundException":
             return
         raise
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:  # the cluster deletes in the background
+        try:
+            kafka.describe_cluster_v2(ClusterArn=arn)
+        except kafka.exceptions.NotFoundException:
+            return
+        time.sleep(15.0)
+    raise AssertionError(f"cluster {arn} still present {timeout_s}s after its delete")
 
 
-def _wait_for_cluster_active(ctx, kafka, arn, timeout_s=1800, interval_s=20):
+def _wait_for_cluster_active(ctx, kafka, arn, timeout_s=2700, interval_s=30):
     deadline = time.monotonic() + timeout_s
     last_state = None
     while time.monotonic() < deadline:
@@ -128,8 +151,21 @@ def _create_scram_secret(ctx, suffix, username="testuser", password="Testpassw0r
         Tags=[{"Key": "sim2real:managed", "Value": "true"}],
     )
     secret_arn = secret["ARN"]
-    ctx.on_cleanup(lambda: sm.delete_secret(SecretId=secret_arn, ForceDeleteWithoutRecovery=True))
+    ctx.on_cleanup(lambda: _delete_secret(sm, secret_arn))
     return secret_arn
+
+
+def _delete_secret(sm, secret_arn, timeout_s=60.0):
+    """Force-delete a secret and wait until it reads as gone, so its KMS key is retired after it."""
+    sm.delete_secret(SecretId=secret_arn, ForceDeleteWithoutRecovery=True)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:  # the secret deletes in the background
+        try:
+            sm.describe_secret(SecretId=secret_arn)
+        except sm.exceptions.ResourceNotFoundException:
+            return
+        time.sleep(2.0)
+    raise AssertionError(f"secret {secret_arn} still present {timeout_s}s after its delete")
 
 
 def _create_default_kms_secret(ctx, suffix, username="baduser", password="Testpassw0rd!123"):

@@ -1,6 +1,7 @@
 """create-component-with-kms-encryption-roundtrip."""
 from __future__ import annotations
 
+import time
 import uuid
 
 from botocore.exceptions import ClientError
@@ -46,7 +47,7 @@ def run(ctx) -> None:
         tags={"sim2real": CHECK},
     )
     arn = resp["componentBuildVersionArn"]
-    ctx.on_cleanup(lambda: _safe(lambda: ib.delete_component(componentBuildVersionArn=arn)))
+    ctx.on_cleanup(lambda: _safe(lambda: _delete_component(ib, arn)))
 
     got = ib.get_component(componentBuildVersionArn=arn)["component"]
     assert got["encrypted"] is True, f"expected encrypted=True for a component created with kmsKeyId, got {got.get('encrypted')!r}"
@@ -85,6 +86,19 @@ def run(ctx) -> None:
 
 
 # ===== helpers =====
+def _delete_component(ib, arn, timeout_s=30.0):
+    """Delete the component and confirm it reads as gone, so its KMS key is retired after it."""
+    ib.delete_component(componentBuildVersionArn=arn)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            ib.get_component(componentBuildVersionArn=arn)
+        except ib.exceptions.ResourceNotFoundException:
+            return
+        time.sleep(2.0)
+    raise AssertionError(f"component {arn} still present {timeout_s}s after its delete")
+
+
 def _safe(fn):
     """Run a teardown delete; only an already-deleted resource is tolerated."""
     try:

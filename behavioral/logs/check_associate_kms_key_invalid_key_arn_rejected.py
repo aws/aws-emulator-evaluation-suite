@@ -97,7 +97,7 @@ def run(ctx) -> None:
             "AssociateKmsKey never succeeded with a valid key (propagation?): "
             f"{last_err.response['Error']['Code'] if last_err else None}"
         )
-    ctx.on_cleanup(lambda: logs.disassociate_kms_key(logGroupName=name))
+    ctx.on_cleanup(lambda: _disassociate_and_wait(logs, name))
 
     described_after = logs.describe_log_groups(logGroupNamePrefix=name)["logGroups"]
     assert described_after and described_after[0].get("kmsKeyId") == key_arn, (
@@ -115,6 +115,18 @@ def _error(fn):
         error = err.response.get("Error", {})
         return error.get("Code"), error.get("Message")
     raise AssertionError(f"expected the call to be rejected, but it succeeded and returned {result!r}")
+
+
+def _disassociate_and_wait(logs, group: str, timeout_s: float = 30.0) -> None:
+    logs.disassociate_kms_key(logGroupName=group)
+    # Wait until the group no longer uses the key: the key's teardown runs next.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        found = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"]
+        if not any(g["logGroupName"] == group and "kmsKeyId" in g for g in found):
+            return
+        time.sleep(2)
+    raise AssertionError(f"log group {group} still has a KMS key after {timeout_s}s")
 
 
 if __name__ == "__main__":

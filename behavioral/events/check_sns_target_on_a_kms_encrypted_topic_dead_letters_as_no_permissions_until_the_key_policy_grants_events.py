@@ -5,6 +5,8 @@ import json
 import re
 import time
 
+from botocore.exceptions import ClientError
+
 from behavioral_harness import tags
 
 CHECK = "sns-target-on-a-kms-encrypted-topic-dead-letters-as-no-permissions-until-the-key-policy-grants-events"
@@ -117,7 +119,7 @@ def _create_topic(ctx, key_id: str) -> str:
     arn = sns.create_topic(Name=ctx.unique_name("sim2real-behav-topic-"),
                            Attributes={"KmsMasterKeyId": key_id},
                            Tags=[{"Key": "sim2real", "Value": CHECK}])["TopicArn"]
-    ctx.on_cleanup(lambda: sns.delete_topic(TopicArn=arn))
+    ctx.on_cleanup(lambda: _delete_topic_and_wait(sns, arn))
     sns.set_topic_attributes(TopicArn=arn, AttributeName="Policy", AttributeValue=json.dumps({
         "Version": "2012-10-17", "Statement": [{
             "Effect": "Allow", "Principal": {"Service": "events.amazonaws.com"},
@@ -196,6 +198,21 @@ def _receive_for(ctx, url: str, seconds: float) -> list[dict]:
     while time.monotonic() < end:
         out += _receive(ctx, url)
     return out
+
+
+def _delete_topic_and_wait(sns, arn: str, timeout_s: float = 30.0) -> None:
+    sns.delete_topic(TopicArn=arn)
+    # Wait until the topic is gone: the key's teardown runs next.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            sns.get_topic_attributes(TopicArn=arn)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "NotFound":
+                return
+            raise
+        time.sleep(2)
+    raise AssertionError(f"topic {arn} still present after {timeout_s}s")
 
 
 if __name__ == "__main__":

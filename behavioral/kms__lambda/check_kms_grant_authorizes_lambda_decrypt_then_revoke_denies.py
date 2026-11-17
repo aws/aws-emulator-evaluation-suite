@@ -181,7 +181,7 @@ def _create_function_with_retry(ctx, handler_code, role_arn, env=None, timeout=3
             resp = lam.create_function(**kwargs)
             ctx.on_cleanup(lambda: ctx.client("lambda").delete_function(FunctionName=name))
             ctx.on_cleanup(
-                lambda: ctx.client("logs").delete_log_group(logGroupName=f"/aws/lambda/{name}")
+                lambda: _delete_function_log_group(ctx, f"/aws/lambda/{name}")
             )
             _wait_function_active(ctx, name)
             return {"name": name, "arn": resp["FunctionArn"]}
@@ -345,9 +345,7 @@ def run(ctx) -> None:
         description="CreateGrant naming a freshly created role as grantee (IAM propagation)",
     )
     grant_id = grant["GrantId"]
-    ctx.on_cleanup(
-        lambda: ctx.client("kms").revoke_grant(KeyId=key["arn"], GrantId=grant_id)
-    )
+    ctx.on_cleanup(lambda: _revoke_grant(ctx, key["arn"], grant_id))
     assert grant.get("GrantToken"), f"CreateGrant must mint a GrantToken: {grant!r}"
 
     granted = _poll_until(
@@ -384,6 +382,24 @@ def run(ctx) -> None:
     assert admin["Plaintext"].decode() == plaintext, (
         "the check's own credentials must still decrypt the ciphertext"
     )
+
+
+def _delete_function_log_group(ctx, name: str) -> None:
+    """Delete a function's log group, which exists only once the function has written a log line."""
+    logs = ctx.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=name)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
+
+
+def _revoke_grant(ctx, key_arn: str, grant_id: str) -> None:
+    """Revoke the grant unless it is already gone: the check revokes it itself once it passes."""
+    kms = ctx.client("kms")
+    try:
+        kms.revoke_grant(KeyId=key_arn, GrantId=grant_id)
+    except kms.exceptions.NotFoundException:
+        pass
 
 
 if __name__ == "__main__":

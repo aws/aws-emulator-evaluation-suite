@@ -191,12 +191,23 @@ def _empty_bucket(s3, bucket_name: str) -> None:
             raise RuntimeError(f"DeleteObjects left {len(failed)} object(s): {failed[:3]}")
 
 
-def _cancel_export_task_best_effort(rds, export_task_id: str) -> None:
+def _cancel_export_task_best_effort(rds, export_task_id, timeout_s=600.0) -> None:
+    """Cancel the export task and wait until it is terminal, so its KMS key is retired after it."""
     try:
         rds.cancel_export_task(ExportTaskIdentifier=export_task_id)
     except ClientError as exc:
-        if exc.response["Error"]["Code"] != "ExportTaskNotFound":
+        code = exc.response["Error"]["Code"]
+        if code == "ExportTaskNotFound":
+            return
+        if code != "InvalidExportTaskStateFault":  # one already finished cannot be canceled
             raise
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:  # the export task cancels in the background
+        tasks = rds.describe_export_tasks(ExportTaskIdentifier=export_task_id)["ExportTasks"]
+        if not tasks or tasks[0]["Status"] in ("COMPLETE", "FAILED", "CANCELED"):
+            return
+        time.sleep(15)
+    raise AssertionError(f"export task {export_task_id} not terminal {timeout_s}s after its cancel")
 
 
 def _wait_db_instance_available(ctx, rds, db_instance_id: str, timeout_s=1200.0, interval_s=15.0):

@@ -248,7 +248,7 @@ def _create_function(ctx: Any, role_arn: str, handler_code: str, suffix: str, ti
         raise AssertionError(f"function {name} never became creatable: {last_err}")
     ctx.on_cleanup(lambda: lam.delete_function(FunctionName=name))
     ctx.on_cleanup(
-        lambda: ctx.client("logs").delete_log_group(logGroupName=f"/aws/lambda/{name}")
+        lambda: _delete_function_log_group(ctx, f"/aws/lambda/{name}")
     )
     _wait_function_active(ctx, name)
     return name
@@ -276,6 +276,15 @@ def _invoke(ctx: Any, name: str, payload: dict) -> dict:
         InvocationType="RequestResponse",
     )
     return json.loads(resp["Payload"].read())
+
+
+def _delete_function_log_group(ctx, name: str) -> None:
+    """Delete a function's log group, which exists only once the function has written a log line."""
+    logs = ctx.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=name)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
 
 
 if __name__ == "__main__":

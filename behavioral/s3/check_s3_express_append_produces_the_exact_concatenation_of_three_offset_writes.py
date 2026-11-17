@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from botocore.exceptions import ClientError
 
+from botocore.config import Config
 from behavioral_harness import tags
 
 CHECK = "s3-express-append-produces-the-exact-concatenation-of-three-offset-writes"
@@ -17,6 +18,11 @@ _TOTAL = len(_C1) + len(_C2) + len(_C3)
 _WRITE_OFFSET_MESSAGE = (
     "The write offset value that you specified does not match the current object size."
 )
+
+
+def _s3_control(ctx):
+    """S3 for a directory bucket's control calls, which AWS serves without an S3 Express session."""
+    return ctx.client("s3", config=Config(s3={"disable_s3_express_session_auth": True}))
 
 
 def _delete_directory_bucket(client, bucket):
@@ -70,7 +76,7 @@ def run(ctx) -> None:
     refusals = {}
     for zone_id in zone_ids:
         candidate = f"{ctx.unique_name('sim2real-behav-dir-')}--{zone_id}--x-s3"
-        exc = _client_error(lambda name=candidate, z=zone_id: s3.create_bucket(
+        exc = _client_error(lambda name=candidate, z=zone_id: _s3_control(ctx).create_bucket(
             Bucket=name,
             CreateBucketConfiguration={
                 "Location": {"Type": "AvailabilityZone", "Name": z},

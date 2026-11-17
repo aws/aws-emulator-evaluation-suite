@@ -281,9 +281,9 @@ def _create_state_machine(ctx, definition, permissions=None) -> dict[str, str]:
 
 
 def _stop_and_delete_state_machine(ctx, arn: str) -> None:
-    """Stop running executions, delete the state machine and wait until it is gone.
+    """Stop running executions, delete the state machine and wait until it is DELETING or gone.
 
-    SFN deletion is asynchronous and a state machine with a RUNNING execution stays DELETING.
+    SFN deletion is asynchronous; a machine does not finish deleting while an execution runs.
     """
     sfn = ctx.client("stepfunctions")
     try:
@@ -303,13 +303,14 @@ def _stop_and_delete_state_machine(ctx, arn: str) -> None:
     deadline = time.monotonic() + 90
     while time.monotonic() < deadline:
         try:
-            sfn.describe_state_machine(stateMachineArn=arn)
+            if sfn.describe_state_machine(stateMachineArn=arn)["status"] == "DELETING":
+                return
         except ClientError as exc:
             if exc.response["Error"]["Code"] != "StateMachineDoesNotExist":
                 raise
             return
         time.sleep(2)
-    raise AssertionError(f"state machine {arn} still exists 90 s after DeleteStateMachine")
+    raise AssertionError(f"state machine {arn} still ACTIVE 90 s after DeleteStateMachine")
 
 
 def _first_execution(ctx, sm_arn, *, trigger, timeout_s=180.0, interval_s=5.0):

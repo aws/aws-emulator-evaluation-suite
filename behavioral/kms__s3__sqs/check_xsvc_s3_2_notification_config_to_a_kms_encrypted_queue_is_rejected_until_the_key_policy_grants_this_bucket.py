@@ -279,11 +279,26 @@ def _create_queue(ctx: Any, kind: str, **attrs: str) -> dict[str, str]:
     url = sqs.create_queue(
         QueueName=name, Attributes=dict(attrs), tags={"sim2real": "xsvc-s3-2"}
     )["QueueUrl"]
-    ctx.on_cleanup(lambda: sqs.delete_queue(QueueUrl=url))
+    ctx.on_cleanup(lambda: _delete_queue_until_gone(sqs, url))
     arn = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"][
         "QueueArn"
     ]
     return {"name": name, "url": url, "arn": arn}
+
+
+def _delete_queue_until_gone(sqs: Any, url: str, timeout_s: float = 40.0) -> None:
+    sqs.delete_queue(QueueUrl=url)
+    # SQS deletes the queue in the background, still using its key until it is gone.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "AWS.SimpleQueueService.NonExistentQueue":
+                return
+            raise
+        time.sleep(2)
+    raise AssertionError(f"queue {url} still exists {timeout_s}s after its delete")
 
 
 def _allow_s3_send(sqs: Any, q: dict[str, str], bucket_arn: str, account: str) -> None:

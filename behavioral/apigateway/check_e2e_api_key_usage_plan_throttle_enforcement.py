@@ -78,7 +78,7 @@ def run(ctx) -> None:
         tags={"sim2real": "api-key-usage-plan-throttle-enforcement"},
     )
     plan_id = plan["id"]
-    ctx.on_cleanup(lambda: _safe_delete_usage_plan(apigw, plan_id))
+    ctx.on_cleanup(lambda: _safe_delete_usage_plan(apigw, plan_id, api_id, stage_name))
 
     apigw.create_usage_plan_key(usagePlanId=plan_id, keyId=key_id, keyType="API_KEY")
     ctx.on_cleanup(lambda: _safe_delete_usage_plan_key(apigw, plan_id, key_id))
@@ -151,7 +151,17 @@ def _safe_delete_api_key(apigw, key_id: str) -> None:
         pass
 
 
-def _safe_delete_usage_plan(apigw, plan_id: str) -> None:
+def _safe_delete_usage_plan(apigw, plan_id: str, api_id: str, stage_name: str) -> None:
+    """Detach the plan's API stage, then delete the plan, which AWS refuses while it has one."""
+    try:
+        apigw.update_usage_plan(
+            usagePlanId=plan_id,
+            patchOperations=[
+                {"op": "remove", "path": "/apiStages", "value": f"{api_id}:{stage_name}"}
+            ],
+        )
+    except apigw.exceptions.NotFoundException:
+        pass
     try:
         apigw.delete_usage_plan(usagePlanId=plan_id)
     except apigw.exceptions.NotFoundException:

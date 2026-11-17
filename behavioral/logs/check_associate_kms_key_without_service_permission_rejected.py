@@ -99,6 +99,8 @@ def run(ctx) -> None:
     )["KeyMetadata"]
     good_key_arn = good_key["Arn"]
     ctx.on_cleanup(lambda: kms.schedule_key_deletion(KeyId=good_key_arn, PendingWindowInDays=7))
+    # Registered after the key, so the group is gone before the key is retired.
+    ctx.on_cleanup(lambda: _delete_log_group_and_wait(logs, log_group_name))
 
     _associate_with_retry(logs, log_group_name, good_key_arn)
     described_after = logs.describe_log_groups(logGroupNamePrefix=log_group_name)["logGroups"]
@@ -150,7 +152,23 @@ def _create_log_group(ctx):
     return name, arn
 
 
-def _associate_with_retry(logs, log_group_name, key_arn, timeout_s=30.0, interval_s=5.0):
+def _delete_log_group_and_wait(logs, name, timeout_s=60.0):
+    """Delete the log group and poll DescribeLogGroups until it no longer lists it."""
+    import time
+
+    _safe(lambda: logs.delete_log_group(logGroupName=name))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        groups = logs.describe_log_groups(logGroupNamePrefix=name)["logGroups"]
+        if not any(g["logGroupName"] == name for g in groups):
+            return
+        time.sleep(2.0)
+    raise AssertionError(f"log group {name} still listed {timeout_s}s after its delete")
+
+
+def _associate_with_retry(logs, log_group_name, key_arn, timeout_s=60.0, interval_s=5.0):
+    """AssociateKmsKey with a key whose policy grants the service, retried while that new key
+    policy propagates (InvalidParameterException or AccessDeniedException)."""
     import time
     from botocore.exceptions import ClientError
 
@@ -162,7 +180,7 @@ def _associate_with_retry(logs, log_group_name, key_arn, timeout_s=30.0, interva
             return
         except ClientError as e:
             last_err = e
-            if e.response["Error"]["Code"] != "InvalidParameterException":
+            if e.response["Error"]["Code"] not in ("InvalidParameterException", "AccessDeniedException"):
                 raise
             time.sleep(interval_s)
     raise AssertionError(f"AssociateKmsKey never succeeded (key-policy propagation?): {last_err}")

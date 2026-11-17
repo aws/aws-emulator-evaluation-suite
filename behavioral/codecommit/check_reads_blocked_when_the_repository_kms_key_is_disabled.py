@@ -64,7 +64,7 @@ def run(ctx) -> None:
     repo = ctx.unique_name("sim2real-behav-cckms-r-")
     meta = cc.create_repository(repositoryName=repo, kmsKeyId=key_arn,
                                tags={"sim2real": "cckms"})["repositoryMetadata"]
-    ctx.on_cleanup(lambda: cc.delete_repository(repositoryName=repo))
+    ctx.on_cleanup(lambda: _delete_repository(cc, repo))
     assert meta["kmsKeyId"] == key_arn, (
         f"CreateRepository reports kmsKeyId {meta['kmsKeyId']!r}, expected the supplied "
         f"{key_arn!r} -- the repository is not on the key under test"
@@ -181,6 +181,19 @@ def run(ctx) -> None:
 
 
 # ===== helpers =====
+
+def _delete_repository(cc, repo: str, timeout_s: float = 30.0) -> None:
+    """Delete a repository and wait until it reads as gone, so its KMS key is retired after it."""
+    cc.delete_repository(repositoryName=repo)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:  # the repository deletes in the background
+        try:
+            cc.get_repository(repositoryName=repo)
+        except cc.exceptions.RepositoryDoesNotExistException:
+            return
+        time.sleep(2.0)
+    raise AssertionError(f"repository {repo} still present {timeout_s}s after its delete")
+
 
 def _swallow(fn):
     try:

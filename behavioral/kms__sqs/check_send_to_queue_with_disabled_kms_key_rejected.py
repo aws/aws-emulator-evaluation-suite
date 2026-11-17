@@ -58,6 +58,21 @@ def _round_trip(sqs, url, body, *, timeout_s):
     return None
 
 
+def _delete_queue_until_gone(sqs, url, timeout_s=40.0):
+    sqs.delete_queue(QueueUrl=url)
+    # SQS deletes the queue in the background, still using its key until it is gone.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "AWS.SimpleQueueService.NonExistentQueue":
+                return
+            raise
+        time.sleep(2)
+    raise AssertionError(f"queue {url} still exists {timeout_s}s after its delete")
+
+
 # timing:real-time — ttl: 60 s https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-server-side-encryption.html
 @tags(
     "axis:rejection",
@@ -97,7 +112,7 @@ def run(ctx) -> None:
                     "KmsDataKeyReusePeriodSeconds": str(_REUSE_S)},
         tags=_TAGS,
     )["QueueUrl"]
-    ctx.on_cleanup(lambda: sqs.delete_queue(QueueUrl=url))
+    ctx.on_cleanup(lambda: _delete_queue_until_gone(sqs, url))
 
     attrs = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["All"])["Attributes"]
     assert attrs.get("KmsMasterKeyId") in (key_arn, key_id), (

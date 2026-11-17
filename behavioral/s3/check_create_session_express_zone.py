@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime
 
+from botocore.config import Config
 from behavioral_harness import tags
 from botocore.exceptions import ClientError
 
@@ -25,6 +26,11 @@ _S3EXPRESS_AZ_BY_REGION = {
     "eu-west-1": ["euw1-az1", "euw1-az3"],
     "eu-north-1": ["eun1-az1", "eun1-az2", "eun1-az3"],
 }
+
+
+def _s3_control(ctx):
+    """S3 for a directory bucket's control calls, which AWS serves without an S3 Express session."""
+    return ctx.client("s3", config=Config(s3={"disable_s3_express_session_auth": True}))
 
 
 @tags("axis:happy-path", "cap:c1", "concern:negative-classes", "concern:representation", "plane:control")
@@ -83,7 +89,7 @@ def _create_directory_bucket(ctx, s3):
     for az in azs:
         bucket = f"{base}--{az}--x-s3"
         try:
-            s3.create_bucket(
+            _s3_control(ctx).create_bucket(
                 Bucket=bucket,
                 CreateBucketConfiguration={
                     "Location": {"Type": "AvailabilityZone", "Name": az},
@@ -103,7 +109,7 @@ def _create_directory_bucket(ctx, s3):
                 if exc.response["Error"]["Code"] not in ("NoSuchBucket", "NoSuchKey"):
                     raise
             try:
-                s3.delete_bucket(Bucket=name)
+                _s3_control(ctx).delete_bucket(Bucket=name)
             except ClientError as exc:
                 if exc.response["Error"]["Code"] != "NoSuchBucket":
                     raise

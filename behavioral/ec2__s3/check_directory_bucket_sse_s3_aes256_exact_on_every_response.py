@@ -5,11 +5,17 @@ from typing import Any
 
 from botocore.exceptions import ClientError
 
+from botocore.config import Config
 from behavioral_harness import tags
 
 CHECK = "directory-bucket-sse-s3-aes256-exact-on-every-response"
 GROUP = "server_side_encryption"
 SERVICES = ["ec2", "s3"]
+
+
+def _s3_control(ctx):
+    """S3 for a directory bucket's control calls, which AWS serves without an S3 Express session."""
+    return ctx.client("s3", config=Config(s3={"disable_s3_express_session_auth": True}))
 
 
 @tags("axis:happy-path", "cap:c2", "concern:data-plane", "concern:representation", "dp:api", "plane:data")
@@ -84,7 +90,7 @@ def _create_directory_bucket(ctx: Any) -> str:
     for zone_id in zone_ids:
         candidate = f"{base}--{zone_id}--x-s3"
         try:
-            s3.create_bucket(
+            _s3_control(ctx).create_bucket(
                 Bucket=candidate,
                 CreateBucketConfiguration={
                     "Location": {"Type": "AvailabilityZone", "Name": zone_id},
@@ -111,7 +117,7 @@ def _create_directory_bucket(ctx: Any) -> str:
             if exc.response["Error"]["Code"] not in ("NoSuchBucket", "NoSuchKey"):
                 raise
         try:
-            s3.delete_bucket(Bucket=bucket)
+            _s3_control(ctx).delete_bucket(Bucket=bucket)
         except ClientError as exc:
             if exc.response["Error"]["Code"] != "NoSuchBucket":
                 raise

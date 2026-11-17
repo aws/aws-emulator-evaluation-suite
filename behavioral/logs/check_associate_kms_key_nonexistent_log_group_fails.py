@@ -106,6 +106,7 @@ def run(ctx) -> None:
                     f"a key policy that permits CloudWatch Logs should succeed, got {err!r}"
                 ) from err
         time.sleep(2)
+    ctx.on_cleanup(lambda: _disassociate_and_wait(logs, real_log_group))
 
     control_described = logs.describe_log_groups(logGroupNamePrefix=real_log_group)[
         "logGroups"
@@ -155,6 +156,18 @@ def _error(fn: Callable[[], Any]) -> tuple[str, str]:
         error = err.response.get("Error", {})
         return error.get("Code"), error.get("Message")
     raise AssertionError(f"expected the call to be rejected, but it succeeded and returned {result!r}")
+
+
+def _disassociate_and_wait(logs, group: str, timeout_s: float = 30.0) -> None:
+    logs.disassociate_kms_key(logGroupName=group)
+    # Wait until the group no longer uses the key: the key's teardown runs next.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        found = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"]
+        if not any(g["logGroupName"] == group and "kmsKeyId" in g for g in found):
+            return
+        time.sleep(2)
+    raise AssertionError(f"log group {group} still has a KMS key after {timeout_s}s")
 
 
 if __name__ == "__main__":

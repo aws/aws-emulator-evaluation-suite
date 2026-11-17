@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 from botocore.exceptions import ClientError
 
@@ -45,7 +46,7 @@ def run(ctx) -> None:
     # --- positive control: the granted key is accepted on create. ---
     bus = ctx.unique_name("sim2real-behav-bus-")
     events.create_event_bus(Name=bus, KmsKeyIdentifier=granted_key, Tags=[{"Key": "sim2real", "Value": CHECK}])
-    ctx.on_cleanup(lambda: events.delete_event_bus(Name=bus))
+    ctx.on_cleanup(lambda: _delete_bus_and_wait(events, bus))
     assert events.describe_event_bus(Name=bus).get("KmsKeyIdentifier") == granted_key, (
         "a bus created with a key that grants EventBridge must report that key"
     )
@@ -109,6 +110,21 @@ def _error(fn) -> tuple[str, str]:
         err = exc.response.get("Error", {})
         return err.get("Code"), err.get("Message")
     raise AssertionError(f"expected the call to be refused, but it succeeded: {result!r}")
+
+
+def _delete_bus_and_wait(events, bus: str, timeout_s: float = 30.0) -> None:
+    events.delete_event_bus(Name=bus)
+    # Wait until the bus is gone: the key's teardown runs next.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            events.describe_event_bus(Name=bus)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ResourceNotFoundException":
+                return
+            raise
+        time.sleep(2)
+    raise AssertionError(f"event bus {bus} still present after {timeout_s}s")
 
 
 if __name__ == "__main__":

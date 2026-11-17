@@ -114,10 +114,23 @@ def run(ctx) -> None:
             last_message = err.get("Message")
             time.sleep(3.0)
     assert good_arn is not None, f"positive control never succeeded within 180s, last message: {last_message!r}"
-    ctx.on_cleanup(lambda: sfn.delete_activity(activityArn=good_arn))
+    ctx.on_cleanup(lambda: _delete_activity(sfn, good_arn))
     assert _poll_lists_activity(sfn, good_name, True), (
         f"expected the positive-control activity {good_name!r} to be created and listed"
     )
+
+
+def _delete_activity(sfn, arn: str, timeout_s: float = 300.0) -> None:
+    """Delete an activity, then poll until DescribeActivity no longer finds it."""
+    sfn.delete_activity(activityArn=arn)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            sfn.describe_activity(activityArn=arn)
+        except sfn.exceptions.ActivityDoesNotExist:
+            return
+        time.sleep(2.0)
+    raise AssertionError(f"activity {arn} still exists {timeout_s}s after DeleteActivity")
 
 
 if __name__ == "__main__":

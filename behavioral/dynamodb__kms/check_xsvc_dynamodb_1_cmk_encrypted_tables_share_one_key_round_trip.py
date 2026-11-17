@@ -25,6 +25,12 @@ def _wait_active(ddb, table, deadline_s=240):
     raise AssertionError(f'{table} never reached ACTIVE within {deadline_s}s')
 
 
+def _delete_table_until_gone(ddb, table):
+    ddb.delete_table(TableName=table)
+    # DynamoDB deletes the table in the background, still using its key until it is gone.
+    ddb.get_waiter('table_not_exists').wait(TableName=table, WaiterConfig={'Delay': 2, 'MaxAttempts': 100})
+
+
 def _create_cmk_table(ctx, ddb, key_id):
     # The BARE KEY ID goes in, deliberately: reporting the full ARN back requires resolving the
     # id in KMS, which an echo of the input cannot fake.
@@ -37,7 +43,7 @@ def _create_cmk_table(ctx, ddb, key_id):
         SSESpecification={'Enabled': True, 'SSEType': 'KMS', 'KMSMasterKeyId': key_id},
         Tags=_DDB_TAGS,
     )
-    ctx.on_cleanup(lambda: ddb.delete_table(TableName=table))
+    ctx.on_cleanup(lambda: _delete_table_until_gone(ddb, table))
     return table
 
 

@@ -1,0 +1,340 @@
+"""iot-topic-rule-sql-transforms-the-payload-and-routes-it-to-sqs."""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import socket
+import ssl
+import tempfile
+import threading
+import time
+
+from behavioral_harness import tags
+from botocore.exceptions import ClientError
+
+CHECK = "iot-topic-rule-sql-transforms-the-payload-and-routes-it-to-sqs"
+GROUP = 'mqtt-data-plane'
+SERVICES = ['iot', 'sqs']
+
+_ABOVE_THRESHOLD_PUBLISHES = 11
+
+
+def _ats_endpoint(ctx) -> str:
+    """The account's own iot:Data-ATS broker host, once its DNS record exists.
+
+    On a new account the first DescribeEndpoint creates the hostname, which stays unresolvable
+    for up to a minute; wait for the DNS record before handing the host to the MQTT client.
+    """
+    host = ctx.client("iot").describe_endpoint(endpointType="iot:Data-ATS")["endpointAddress"]
+    deadline = time.time() + 180
+    last = None
+    while time.time() < deadline:
+        try:
+            socket.getaddrinfo(*ctx.endpoint_host(host, 8883))
+            return host
+        except OSError as exc:
+            last = exc
+            time.sleep(3)
+    raise AssertionError(f"the ATS endpoint {host!r} never resolved in DNS: {last!r}")
+
+
+def _delete_policy(iot, name: str) -> None:
+    """A policy cannot be deleted while attached to a target or while extra versions exist."""
+    for v in iot.list_policy_versions(policyName=name).get("policyVersions", []):
+        if not v.get("isDefaultVersion"):
+            try:
+                iot.delete_policy_version(policyName=name, policyVersionId=v["versionId"])
+            except ClientError as exc:
+                if exc.response["Error"]["Code"] != "ResourceNotFoundException":
+                    raise
+    for target in iot.list_targets_for_policy(policyName=name).get("targets", []):
+        try:
+            iot.detach_policy(policyName=name, target=target)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "ResourceNotFoundException":
+                raise
+    iot.delete_policy(policyName=name)
+
+
+def _delete_certificate(iot, cert_id: str) -> None:
+    """A certificate must be detached from every policy/thing and set INACTIVE before delete."""
+    try:
+        arn = iot.describe_certificate(certificateId=cert_id)[
+            "certificateDescription"]["certificateArn"]
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "ResourceNotFoundException":
+            return
+        raise
+    for p in iot.list_attached_policies(target=arn).get("policies", []):
+        try:
+            iot.detach_policy(policyName=p["policyName"], target=arn)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "ResourceNotFoundException":
+                raise
+    for t in iot.list_principal_things(principal=arn).get("things", []):
+        try:
+            iot.detach_thing_principal(thingName=t, principal=arn)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "ResourceNotFoundException":
+                raise
+    iot.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
+    iot.delete_certificate(certificateId=cert_id, forceDelete=True)
+
+
+def _provision_identity(ctx, iot, workdir: str, actions: list[str], scenario: str, label: str):
+    """A device identity usable for mutual-TLS MQTT: thing + policy + certificate + PEM files.
+
+    The PEM files go in a per-run mkdtemp directory, never a fixed /tmp path -- the harness host
+    is shared, and a predictable name is a measured cross-run clobber.
+    """
+    thing = ctx.unique_name("sim2real-iot-thing-")
+    iot.create_thing(thingName=thing, attributePayload={"attributes": {"sim2real": scenario}})
+    ctx.on_cleanup(lambda: iot.delete_thing(thingName=thing))
+
+    policy = ctx.unique_name("sim2real-iot-pol-")
+    iot.create_policy(
+        policyName=policy,
+        policyDocument=json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": actions, "Resource": "*"}],
+        }),
+        tags=[{"Key": "sim2real", "Value": scenario}],
+    )
+    ctx.on_cleanup(lambda: _delete_policy(iot, policy))
+
+    cert = iot.create_keys_and_certificate(setAsActive=True)
+    cert_id, cert_arn = cert["certificateId"], cert["certificateArn"]
+    ctx.on_cleanup(lambda: _delete_certificate(iot, cert_id))
+    iot.attach_policy(policyName=policy, target=cert_arn)
+    ctx.on_cleanup(lambda: iot.detach_policy(policyName=policy, target=cert_arn))
+    iot.attach_thing_principal(thingName=thing, principal=cert_arn)
+    ctx.on_cleanup(lambda: iot.detach_thing_principal(thingName=thing, principal=cert_arn))
+
+    cert_path = os.path.join(workdir, f"{label}-cert.pem")
+    key_path = os.path.join(workdir, f"{label}-key.pem")
+    with open(cert_path, "w") as fh:
+        fh.write(cert["certificatePem"])
+    with open(key_path, "w") as fh:
+        fh.write(cert["keyPair"]["PrivateKey"])
+    return {"thing": thing, "policy": policy, "cert_id": cert_id, "cert_arn": cert_arn,
+            "cert_path": cert_path, "key_path": key_path}
+
+
+def _mqtt_connect(ctx, host: str, identity: dict, client_id: str, timeout_s: int = 120):
+    """A mutually-authenticated MQTT 3.1.1 session, with a bounded CONNACK retry.
+
+    The retry is on rc != 0 rather than a bare sleep because the certificate's policy attachment
+    is eventually consistent at the broker; a successful CONNACK is therefore also the barrier
+    proving the policy is in force.
+    """
+    import paho.mqtt.client as mqtt
+
+    state = {"rc": None, "connected": threading.Event(), "suback": {}, "messages": [],
+             "disconnects": [], "lock": threading.Lock()}
+
+    def on_connect(_c, _u, _flags, rc):
+        state["rc"] = int(rc)
+        if int(rc) == 0:
+            state["connected"].set()
+
+    def on_subscribe(_c, _u, mid, granted_qos):
+        with state["lock"]:
+            state["suback"][mid] = [int(q) for q in granted_qos]
+
+    def on_message(_c, _u, msg):
+        with state["lock"]:
+            state["messages"].append(msg)
+
+    def on_disconnect(_c, _u, rc):
+        state["disconnects"].append(int(rc))
+
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id=client_id, clean_session=True)
+    client.tls_set(cert_reqs=ssl.CERT_NONE, certfile=identity["cert_path"], keyfile=identity["key_path"],
+                   tls_version=ssl.PROTOCOL_TLS_CLIENT)
+    client.on_connect = on_connect
+    client.on_subscribe = on_subscribe
+    client.on_message = on_message
+    client.on_disconnect = on_disconnect
+    ctx.on_cleanup(lambda: _mqtt_close(client))
+
+    deadline = time.time() + timeout_s
+    last = None
+    while time.time() < deadline:
+        try:
+            client.connect(*ctx.endpoint_host(host, 8883), keepalive=30)
+            client.loop_start()
+            if state["connected"].wait(timeout=20):
+                return client, state
+            client.loop_stop()
+        except Exception as exc:  # noqa: BLE001 - retried below, reported if it never clears
+            last = exc
+            try:
+                client.loop_stop()
+            except Exception:  # noqa: BLE001
+                pass
+        state["connected"].clear()
+        time.sleep(3)
+    raise AssertionError(
+        f"{client_id!r} never got CONNACK rc=0 from {host}:8883 within {timeout_s}s; "
+        f"last rc {state['rc']!r}, last exception {last!r}"
+    )
+
+
+def _mqtt_close(client) -> None:
+    client.loop_stop()
+    client.disconnect()
+
+
+def _publish_acked(client, topic: str, payload: bytes, timeout_s: int = 30) -> None:
+    info = client.publish(topic, payload, qos=1)
+    deadline = time.time() + timeout_s
+    while time.time() < deadline and not info.is_published():
+        time.sleep(0.1)
+    assert info.is_published(), f"the broker never PUBACKed the publish to {topic!r}"
+
+
+def _rules_engine_role(ctx, iam, sqs, queue_url: str, scenario: str) -> str:
+    """A role the rules engine can assume to send to ``queue_url``.
+
+    IAM is eventually consistent and CreateTopicRule validates the role at creation, so the
+    bounded retry belongs on the FIRST USE of the permission -- that is the caller's
+    ``_create_topic_rule_when_iam_settles``, not on create_role.
+    """
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    role_name = ctx.unique_name("sim2real-iot-rule-role-")
+    role_arn = iam.create_role(
+        RoleName=role_name,
+        AssumeRolePolicyDocument=json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Principal": {"Service": "iot.amazonaws.com"},
+                           "Action": "sts:AssumeRole"}],
+        }),
+        Tags=[{"Key": "sim2real", "Value": scenario}],
+    )["Role"]["Arn"]
+    ctx.on_cleanup(lambda: iam.delete_role(RoleName=role_name))
+    iam.put_role_policy(
+        RoleName=role_name, PolicyName="send-to-queue",
+        PolicyDocument=json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": "sqs:SendMessage", "Resource": queue_arn}],
+        }),
+    )
+    ctx.on_cleanup(lambda: iam.delete_role_policy(RoleName=role_name, PolicyName="send-to-queue"))
+    return role_arn
+
+
+def _create_topic_rule_when_iam_settles(ctx, iot, rule_name: str, payload: dict,
+                                        timeout_s: int = 180) -> None:
+    """CreateTopicRule with an Sqs action validates that IoT can assume the action's role, and a
+    role created seconds earlier is still propagating. Retry the CREATE -- it is the first use of
+    the role's trust policy -- and fail loudly if it never clears."""
+    deadline = time.time() + timeout_s
+    last = None
+    while time.time() < deadline:
+        try:
+            iot.create_topic_rule(ruleName=rule_name, topicRulePayload=payload,
+                                  tags="sim2real=iot-rule-sql")
+            ctx.on_cleanup(lambda: iot.delete_topic_rule(ruleName=rule_name))
+            return
+        except Exception as exc:  # noqa: BLE001 - IAM propagation, retried
+            last = exc
+            time.sleep(5)
+    raise AssertionError(f"CreateTopicRule({rule_name!r}) never succeeded: {last!r}")
+
+
+def _drain(sqs, queue_url: str, want: int, timeout_s: int, extra_s: int = 20) -> list[str]:
+    """Long-poll every body out of the queue, then keep draining for ``extra_s`` more so an
+    UNWANTED extra message is collected too rather than silently left behind."""
+    bodies: list[str] = []
+    deadline = time.time() + timeout_s
+    while time.time() < deadline and len(bodies) < want:
+        resp = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=20)
+        for msg in resp.get("Messages", []):
+            bodies.append(msg["Body"])
+            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+    tail = time.time() + extra_s
+    while time.time() < tail:
+        resp = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=5)
+        for msg in resp.get("Messages", []):
+            bodies.append(msg["Body"])
+            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+    return bodies
+
+
+@tags(
+    "axis:happy-path",
+    "concern:data-plane",
+    "concern:e2e",
+    "concern:eventing",
+    "dp:native",
+    "plane:data",
+    "cap:c1",
+)
+def run(ctx) -> None:
+    """The rules engine executes its SQL: an MQTT publish above the WHERE threshold arrives in SQS
+    as the projected document the SELECT computed, and a publish below the threshold produces
+    nothing even after the above-threshold messages have landed."""
+    iot = ctx.client("iot")
+    iam = ctx.client("iam")
+    sqs = ctx.client("sqs")
+    host = _ats_endpoint(ctx)
+    scenario = "iot-rule-sql"
+
+    queue_url = sqs.create_queue(
+        QueueName=ctx.unique_name("sim2real-iot-q-"),
+        tags={"sim2real": scenario},
+    )["QueueUrl"]
+    ctx.on_cleanup(lambda: sqs.delete_queue(QueueUrl=queue_url))
+    role_arn = _rules_engine_role(ctx, iam, sqs, queue_url, scenario)
+
+    rule_name = ctx.unique_name("sim2real_iot_rule_")
+    topic = f"sim2real/{ctx.unique_name('m')}/rule"
+    sql = f"SELECT temp * 2 AS doubled FROM '{topic}' WHERE temp > 10"
+    _create_topic_rule_when_iam_settles(ctx, iot, rule_name, {
+        "sql": sql,
+        "awsIotSqlVersion": "2016-03-23",
+        "ruleDisabled": False,
+        "description": "sim2real behavioral rules-engine SQL projection",
+        "actions": [{"sqs": {"queueUrl": queue_url, "roleArn": role_arn, "useBase64": False}}],
+    })
+    fetched = iot.get_topic_rule(ruleName=rule_name)["rule"]
+    assert fetched["sql"] == sql, f"the stored rule SQL is {fetched['sql']!r}, sent {sql!r}"
+
+    workdir = tempfile.mkdtemp(prefix="sim2real-iot-mqtt-")
+    ctx.on_cleanup(lambda: shutil.rmtree(workdir, ignore_errors=True))
+    identity = _provision_identity(
+        ctx, iot, workdir, ["iot:Connect", "iot:Publish", "iot:Subscribe", "iot:Receive"],
+        scenario, "device")
+    device, dev_state = _mqtt_connect(ctx, host, identity, ctx.unique_name("sim2real-iot-dev-"))
+    assert dev_state["rc"] == 0, f"the device's CONNACK was {dev_state['rc']!r}"
+
+    # Below the WHERE threshold: this one must produce nothing. It goes FIRST so it has the
+    # longest possible time to wrongly arrive.
+    _publish_acked(device, topic, json.dumps({"temp": 1}).encode())
+    for i in range(_ABOVE_THRESHOLD_PUBLISHES):
+        _publish_acked(device, topic, json.dumps({"temp": 30, "seq": i}).encode())
+
+    bodies = _drain(sqs, queue_url, _ABOVE_THRESHOLD_PUBLISHES, 180)
+    parsed = [json.loads(b) for b in bodies]
+    assert len(bodies) == _ABOVE_THRESHOLD_PUBLISHES, (
+        f"collected {len(bodies)!r} bodies, expected {_ABOVE_THRESHOLD_PUBLISHES!r}: {bodies!r}"
+    )
+    assert all(d == {"doubled": 60} for d in parsed), (
+        f"the SELECT did not compute temp*2 into a projection named 'doubled': {parsed!r}"
+    )
+    assert all("temp" not in d for d in parsed), (
+        f"the projection leaked the source field: {parsed!r}"
+    )
+    assert all("seq" not in d for d in parsed), (
+        f"the projection leaked a field the SELECT did not name: {parsed!r}"
+    )
+    assert sum(1 for d in parsed if d.get("doubled") == 2) == 0, (
+        f"the below-threshold publish was routed despite WHERE temp > 10: {parsed!r}"
+    )
+
+
+if __name__ == "__main__":
+    from fidelity_tests_runner import main
+    main(run)

@@ -52,13 +52,25 @@ def _restore_key_policy(kms, key_id: str, policy: str) -> None:
     kms.put_key_policy(KeyId=key_id, PolicyName="default", Policy=policy)
 
 
-def _reap_secret(sm, secret_id: str) -> None:
+def _reap_secret(sm, secret_id: str, timeout_s: float = 30.0) -> None:
     """Delete the secret this check created, with no recovery window so nothing is left behind."""
     try:
         sm.delete_secret(SecretId=secret_id, ForceDeleteWithoutRecovery=True)
     except ClientError as exc:
         if exc.response.get("Error", {}).get("Code") != "ResourceNotFoundException":
             raise
+        return
+    # Secrets Manager deletes the secret in the background, still using its key until it is gone.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            sm.describe_secret(SecretId=secret_id)
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
+                return
+            raise
+        time.sleep(2)
+    raise AssertionError(f"secret {secret_id} still exists {timeout_s}s after its delete")
 
 
 def _poll_until(fn, predicate, *, timeout_s: float, interval_s: float = 5.0, what: str = ""):

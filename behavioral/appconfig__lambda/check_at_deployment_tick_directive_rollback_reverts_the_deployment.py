@@ -321,7 +321,7 @@ def run(ctx) -> None:
     ctx.on_cleanup(lambda: lam.delete_function(FunctionName=fn_name))
     # The log group appears on first invocation; cleanup tolerates it not existing.
     ctx.on_cleanup(
-        lambda: ctx.client("logs").delete_log_group(logGroupName=f"/aws/lambda/{fn_name}")
+        lambda: _delete_function_log_group(ctx, f"/aws/lambda/{fn_name}")
     )
     lam.get_waiter("function_active_v2").wait(FunctionName=fn_name, WaiterConfig={"Delay": 2, "MaxAttempts": 150})
     lam.add_permission(
@@ -544,6 +544,15 @@ def run(ctx) -> None:
         f"the reinstated deployment must reach the data plane: expected version 2's exact bytes, "
         f"served {served_v2!r}"
     )
+
+
+def _delete_function_log_group(ctx, name: str) -> None:
+    """Delete a function's log group, which exists only once the function has written a log line."""
+    logs = ctx.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=name)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
 
 
 if __name__ == "__main__":

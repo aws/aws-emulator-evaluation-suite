@@ -71,8 +71,10 @@ uv run fidelity-tests-runner summarize reports --by-service
 
 The runner accepts only a loopback endpoint and signs with the keys the emulator wrote. It runs
 each fidelity test without the AWS credentials, profiles, or proxy settings in your environment,
-and refuses URLs it builds for a test that point outside the machine or a private network. It
-does not restrict the network access of tools and containers a test starts.
+and refuses URLs it builds for a test that point outside the machine or a private network. An AWS
+SDK request to a host the emulator does not serve, and a host name a test resolves itself through
+`urllib`, `http.client` or `requests`, fail the test ("the emulator serves no address") before
+anything is sent. It does not restrict the network access of tools and containers a test starts.
 
 ## License
 

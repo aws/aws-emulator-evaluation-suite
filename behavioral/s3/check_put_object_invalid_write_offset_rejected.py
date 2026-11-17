@@ -5,6 +5,7 @@ from typing import Any
 
 from botocore.exceptions import ClientError
 
+from botocore.config import Config
 from behavioral_harness import tags
 
 CHECK = "put-object-invalid-write-offset-rejected"
@@ -24,6 +25,11 @@ EXPRESS_ZONE_IDS = {
     "eu-west-1": "euw1-az1",
     "eu-north-1": "eun1-az1",
 }
+
+
+def _s3_control(ctx):
+    """S3 for a directory bucket's control calls, which AWS serves without an S3 Express session."""
+    return ctx.client("s3", config=Config(s3={"disable_s3_express_session_auth": True}))
 
 
 @tags("axis:rejection", "cap:c2", "concern:data-plane", "concern:negative-classes", "dp:api", "plane:data")
@@ -97,7 +103,7 @@ def _create_directory_bucket(ctx: Any) -> str:
     base = ctx.unique_name("s3xb").replace("_", "-").lower()
     bucket = f"{base}--{zone_id}--x-s3"
     try:
-        s3.create_bucket(
+        _s3_control(ctx).create_bucket(
             Bucket=bucket,
             CreateBucketConfiguration={
                 "Location": {"Type": "AvailabilityZone", "Name": zone_id},
@@ -117,7 +123,7 @@ def _create_directory_bucket(ctx: Any) -> str:
             if exc.response["Error"]["Code"] not in ("NoSuchBucket", "NoSuchKey"):
                 raise
         try:
-            s3.delete_bucket(Bucket=bucket)
+            _s3_control(ctx).delete_bucket(Bucket=bucket)
         except ClientError as exc:
             if exc.response["Error"]["Code"] != "NoSuchBucket":
                 raise
